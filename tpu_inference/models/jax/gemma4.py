@@ -945,6 +945,13 @@ class Gemma4Model(JaxModule):
         return ((per_layer_projection + per_layer_embeds) *
                 self.per_layer_input_scale)
 
+    def embed_input_ids(self, input_ids: jax.Array) -> jax.Array:
+        inputs_embeds = self.embed_tokens(input_ids)
+        target_dtype = inputs_embeds.dtype
+        if self.embedding_scale is not None:
+            inputs_embeds = (inputs_embeds * self.embedding_scale).astype(target_dtype)
+        return inputs_embeds
+
     def __call__(
         self,
         kv_caches: List[jax.Array],
@@ -1113,3 +1120,6 @@ class Gemma4ForCausalLM(JaxModule, LoadableWithIterator):
                 logits /
                 self.final_logit_softcapping) * self.final_logit_softcapping
         return logits
+
+    def embed_input_ids(self, input_ids: jax.Array, *args, **kwargs) -> jax.Array:
+        return self.language_model.embed_input_ids(input_ids)
