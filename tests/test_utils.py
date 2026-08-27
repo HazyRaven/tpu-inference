@@ -14,9 +14,10 @@ from torchax.ops.mappings import t2j as ref_t2j
 # Import the functions to be tested
 from tpu_inference.utils import (GBYTES, enable_megacore, get_device_hbm_limit,
                                  get_device_name, get_jax_dtype_from_str_dtype,
-                                 get_layer_kv_params, get_megacore,
-                                 get_padded_head_dim, hbm_usage_bytes,
-                                 hbm_usage_gb)
+                                 get_layer_kv_params, get_layer_sliding_window,
+                                 get_megacore, get_padded_head_dim,
+                                 get_swa_blocks_per_req,
+                                 hbm_usage_bytes, hbm_usage_gb)
 from tpu_inference.utils import t2j as t2j
 
 
@@ -380,3 +381,141 @@ def test_get_layer_kv_params_magicmock_takes_flat_path():
     config.attention_k_eq_v = True
     assert get_layer_kv_params(config, "full_attention") == (512, 4)
     assert get_layer_kv_params(config, "sliding_attention") == (256, 16)
+
+
+def test_get_layer_sliding_window_flat():
+    class FlatConfig:
+        is_heterogeneous = False
+        sliding_window = 1024
+
+    assert get_layer_sliding_window(FlatConfig(), 0, "sliding_attention") == 1024
+    assert get_layer_sliding_window(FlatConfig(), 0, "full_attention") is None
+
+
+def test_get_layer_sliding_window_heterogeneous_list():
+    class LayerCfg:
+        def __init__(self, sw):
+            self.sliding_window = sw
+
+    class HetListConfig:
+        is_heterogeneous = True
+        per_layer_config = [LayerCfg(1024), LayerCfg(512), LayerCfg(None)]
+
+    assert get_layer_sliding_window(HetListConfig(), 0, "sliding_attention") == 1024
+    assert get_layer_sliding_window(HetListConfig(), 1, "sliding_attention") == 512
+    assert get_layer_sliding_window(HetListConfig(), 2, "sliding_attention") is None
+    assert get_layer_sliding_window(HetListConfig(), 0, "full_attention") is None
+
+
+def test_get_layer_sliding_window_falsy_and_zero_values():
+    class LayerCfg:
+        def __init__(self, sw):
+            self.sliding_window = sw
+
+    class HetConfig:
+        is_heterogeneous = True
+        per_layer_config = [
+            LayerCfg(0),
+            LayerCfg(None),
+            LayerCfg(-1),
+            LayerCfg(1024),
+            {"sliding_window": 0},
+            {"sliding_window": None},
+            {"sliding_window": -1},
+            {"sliding_window": 512},
+        ]
+
+    # Explicit 0, None, -1 return None (full attention)
+    assert get_layer_sliding_window(HetConfig(), 0, "sliding_attention") is None
+    assert get_layer_sliding_window(HetConfig(), 1, "sliding_attention") is None
+    assert get_layer_sliding_window(HetConfig(), 2, "sliding_attention") is None
+    assert get_layer_sliding_window(HetConfig(), 3, "sliding_attention") == 1024
+    assert get_layer_sliding_window(HetConfig(), 4, "sliding_attention") is None
+    assert get_layer_sliding_window(HetConfig(), 5, "sliding_attention") is None
+    assert get_layer_sliding_window(HetConfig(), 6, "sliding_attention") is None
+    assert get_layer_sliding_window(HetConfig(), 7, "sliding_attention") == 512
+
+    class FlatZeroConfig:
+        is_heterogeneous = False
+        sliding_window = 0
+
+    class FlatNoneConfig:
+        is_heterogeneous = False
+        sliding_window = None
+
+    assert get_layer_sliding_window(FlatZeroConfig(), 0, "sliding_attention") is None
+    assert get_layer_sliding_window(FlatNoneConfig(), 0, "sliding_attention") is None
+
+
+def test_get_layer_sliding_window_heterogeneous_dict_str_keys():
+    class HetDictConfig:
+        is_heterogeneous = True
+        per_layer_config = {
+            "0": {"sliding_window": 1024, "head_dim": 256, "num_key_value_heads": 16},
+            "1": {"sliding_window": 2048, "head_dim": 256, "num_key_value_heads": 16},
+        }
+
+    assert get_layer_sliding_window(HetDictConfig(), 0, "sliding_attention") == 1024
+    assert get_layer_sliding_window(HetDictConfig(), 1, "sliding_attention") == 2048
+    assert get_layer_sliding_window(HetDictConfig(), 0, "full_attention") is None
+
+
+def test_get_layer_sliding_window_heterogeneous_dict_int_keys():
+    class HetDictConfig:
+        is_heterogeneous = True
+        per_layer_config = {
+            0: {"sliding_window": 1024},
+            1: {"sliding_window": 4096},
+        }
+
+    assert get_layer_sliding_window(HetDictConfig(), 0, "sliding_attention") == 1024
+    assert get_layer_sliding_window(HetDictConfig(), 1, "sliding_attention") == 4096
+
+
+def test_get_layer_kv_params_heterogeneous_dict():
+    class HetDictConfig:
+        is_heterogeneous = True
+        layer_types = ["sliding_attention", "full_attention"]
+        per_layer_config = {
+            "0": {"head_dim": 256, "num_key_value_heads": 16},
+            "1": {"head_dim": 512, "num_key_value_heads": 4},
+        }
+
+    assert get_layer_kv_params(HetDictConfig(), "sliding_attention") == (256, 16)
+    assert get_layer_kv_params(HetDictConfig(), "full_attention") == (512, 4)
+
+
+def test_swa_blocks_per_req_includes_chunk_size():
+    # W=1024, B=16, C=512, K=1 (extra=0) -> active_span = 1023 + 512 = 1535 -> ceil(1535/16) + 1 = 97
+    assert get_swa_blocks_per_req(sliding_window=1024, block_size=16, max_num_batched_tokens=512, extra_retained_tokens=0) == 97
+
+    # W=1024, B=16, C=512, K=4 (extra=3) -> active_span = 1023 + 512 + 3 = 1538 -> ceil(1538/16) + 1 = 98
+    assert get_swa_blocks_per_req(sliding_window=1024, block_size=16, max_num_batched_tokens=512, extra_retained_tokens=3) == 98
+
+    # Decode only: C=1, extra=0 -> active_span = 1023 + 1 = 1024 -> ceil(1024/16) + 1 = 65
+    assert get_swa_blocks_per_req(sliding_window=1024, block_size=16, max_num_batched_tokens=1, extra_retained_tokens=0) == 65
+
+
+def test_swa_blocks_per_req_dynamic_c_max_scaling():
+    # Test across multiple C_max values
+    # C=128: 1023 + 128 = 1151 -> ceil(1151/16) + 1 = 72 + 1 = 73
+    assert get_swa_blocks_per_req(sliding_window=1024, block_size=16, max_num_batched_tokens=128) == 73
+
+    # C=512: 1023 + 512 = 1535 -> 96 + 1 = 97
+    assert get_swa_blocks_per_req(sliding_window=1024, block_size=16, max_num_batched_tokens=512) == 97
+
+    # C=2048: 1023 + 2048 = 3071 -> ceil(3071/16) + 1 = 192 + 1 = 193
+    assert get_swa_blocks_per_req(sliding_window=1024, block_size=16, max_num_batched_tokens=2048) == 193
+
+    # With max_model_len limiting C
+    assert get_swa_blocks_per_req(sliding_window=1024, block_size=16, max_num_batched_tokens=2048, max_model_len=512) == 97
+
+
+def test_swa_blocks_per_req_assertions_and_edge_cases():
+    import pytest
+    with pytest.raises(AssertionError):
+        get_swa_blocks_per_req(sliding_window=0, block_size=16)
+
+    with pytest.raises(AssertionError):
+        get_swa_blocks_per_req(sliding_window=1024, block_size=0)
+

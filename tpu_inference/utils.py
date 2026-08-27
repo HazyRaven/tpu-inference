@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import math
 import time
 from collections import defaultdict
 from collections.abc import Sequence
@@ -145,8 +146,12 @@ def hbm_usage_bytes(devices: Any) -> List[Tuple[int, int]]:
                     e)
     else:
         for device in devices:
-            hbm_used = device.memory_stats()["bytes_in_use"]
-            hbm_limit = device.memory_stats()["bytes_limit"]
+            mem_stats = device.memory_stats() if hasattr(device, "memory_stats") else None
+            if mem_stats is not None:
+                hbm_used = mem_stats.get("bytes_in_use", 0)
+                hbm_limit = mem_stats.get("bytes_limit", 0)
+            else:
+                hbm_used, hbm_limit = 0, 0
             usage.append((hbm_used, hbm_limit))
 
     return usage
@@ -246,6 +251,29 @@ def get_padded_num_heads(num_heads: int, sharding_size: int) -> int:
     return num_heads
 
 
+def _extract_layer_config(per_layer_config: Any, idx: int) -> Any:
+    if per_layer_config is None:
+        return None
+    if isinstance(per_layer_config, dict):
+        if idx in per_layer_config:
+            return per_layer_config[idx]
+        if str(idx) in per_layer_config:
+            return per_layer_config[str(idx)]
+        return None
+    try:
+        if isinstance(idx, int) and hasattr(per_layer_config, "__len__"):
+            if 0 <= idx < len(per_layer_config):
+                return per_layer_config[idx]
+        return per_layer_config[idx]
+    except (IndexError, KeyError, TypeError):
+        pass
+    try:
+        return per_layer_config[str(idx)]
+    except (IndexError, KeyError, TypeError):
+        pass
+    return None
+
+
 def get_layer_kv_params(
         text_config: Any,
         layer_type: str) -> Tuple[Optional[int], Optional[int]]:
@@ -273,21 +301,79 @@ def get_layer_kv_params(
         # Per-layer values depend only on the layer type, so any layer of
         # the same type is representative.
         idx = layer_types.index(layer_type) if layer_type in layer_types else 0
-        layer_config = text_config.per_layer_config[idx]
-        return layer_config.head_dim, layer_config.num_key_value_heads
-    if layer_type == "sliding_attention":
-        return (getattr(text_config, "head_dim",
-                        None), getattr(text_config, "num_key_value_heads",
-                                       None))
-    head_dim = (getattr(text_config, "global_head_dim", None)
-                or getattr(text_config, "head_dim", None))
-    if getattr(text_config, "attention_k_eq_v", False):
-        num_kv_heads = (getattr(text_config, "num_global_key_value_heads",
-                                None)
-                        or getattr(text_config, "num_key_value_heads", None))
-    else:
-        num_kv_heads = getattr(text_config, "num_key_value_heads", None)
-    return head_dim, num_kv_heads
+        per_layer_config = getattr(text_config, "per_layer_config", None)
+        layer_config = _extract_layer_config(per_layer_config, idx)
+        if layer_config is not None:
+            if isinstance(layer_config, dict):
+                return layer_config.get("head_dim"), layer_config.get("num_key_value_heads")
+            return getattr(layer_config, "head_dim", None), getattr(layer_config, "num_key_value_heads", None)
+        return None, None
+    try:
+        if layer_type == "sliding_attention":
+            return (getattr(text_config, "head_dim",
+                            None), getattr(text_config, "num_key_value_heads",
+                                           None))
+        head_dim = (getattr(text_config, "global_head_dim", None)
+                    or getattr(text_config, "head_dim", None))
+        if getattr(text_config, "attention_k_eq_v", False):
+            num_kv_heads = (getattr(text_config, "num_global_key_value_heads",
+                                    None)
+                            or getattr(text_config, "num_key_value_heads", None))
+        else:
+            num_kv_heads = getattr(text_config, "num_key_value_heads", None)
+        return head_dim, num_kv_heads
+    except Exception:
+        return None, None
+
+
+def get_layer_sliding_window(
+        text_config: Any,
+        layer_idx: int,
+        layer_type: str) -> Optional[int]:
+    """Returns sliding_window for one attention layer.
+
+    Sliding window attention layers bound KV cache retention to sliding_window tokens.
+    Full attention layers return None.
+    """
+    if layer_type != "sliding_attention":
+        return None
+    if getattr(text_config, "is_heterogeneous", False) is True:
+        per_layer_config = getattr(text_config, "per_layer_config", None)
+        layer_cfg = _extract_layer_config(per_layer_config, layer_idx)
+        if layer_cfg is not None:
+            sw = layer_cfg.get("sliding_window", None) if isinstance(layer_cfg, dict) else getattr(layer_cfg, "sliding_window", None)
+            if sw is not None and int(sw) > 0:
+                return int(sw)
+            return None  # Explicit Full Attention
+        return 1024
+    try:
+        sw = getattr(text_config, "sliding_window", None)
+        if sw is not None and int(sw) > 0:
+            return int(sw)
+        return None  # Explicit Full Attention
+    except Exception:
+        return None
+
+
+def get_swa_blocks_per_req(
+    sliding_window: int,
+    block_size: int,
+    max_num_batched_tokens: int = 512,
+    extra_retained_tokens: int = 0,
+    max_model_len: Optional[int] = None,
+) -> int:
+    """Computes the exact number of physical blocks required per request for SWA ring buffers.
+
+    Guarantees that chunked prefill (up to max_num_batched_tokens) and speculative prefill tokens
+    never overwrite unread keys in flight.
+    """
+    assert sliding_window > 0, f"sliding_window must be positive, got {sliding_window}"
+    assert block_size > 0, f"block_size must be positive, got {block_size}"
+    effective_chunk = max_num_batched_tokens
+    if max_model_len is not None and max_model_len > 0:
+        effective_chunk = min(effective_chunk, max_model_len)
+    active_span = (int(sliding_window) - 1) + effective_chunk + extra_retained_tokens
+    return math.ceil(active_span / block_size) + 1
 
 
 def get_dtype_packing(dtype):
