@@ -45,17 +45,17 @@ def run_test(model_name, expected_value, more_args=None):
         model_args = "{},{}".format(model_args, more_args)
 
     apply_chat_template = os.environ.get("USE_CHAT_TEMPLATE", "0") == "1"
+    fewshot_as_multiturn = os.environ.get("FEWSHOT_AS_MULTITURN", "0") == "1"
     if apply_chat_template:
-        print("USE_CHAT_TEMPLATE=1: enabling apply_chat_template + "
-              "fewshot_as_multiturn for lm_eval. Required for instruction-"
-              "tuned BOS-sensitive models like gemma-4-it.")
+        print("USE_CHAT_TEMPLATE=1: enabling apply_chat_template for lm_eval. "
+              f"fewshot_as_multiturn={fewshot_as_multiturn}.")
 
     results = evaluate_with_vllm(
         model_args=model_args,
         tasks="gsm8k",
         batch_size="auto",
         apply_chat_template=apply_chat_template,
-        fewshot_as_multiturn=apply_chat_template,
+        fewshot_as_multiturn=fewshot_as_multiturn,
     )
 
     # gsm8k emits two filters: strict-match (default gate) and flexible-extract.
