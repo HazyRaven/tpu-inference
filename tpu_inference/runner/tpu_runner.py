@@ -1464,21 +1464,26 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             if not sampled_ids:
                 continue
 
-            # If request not active in the *current* batch (e.g. finished or evicted), skip it.
             req_id = pre_req_ids[pre_req_idx]
+            pre_num_placeholder_tokens = 1
+            if pre_scheduler_output is not None:
+                pre_num_placeholder_tokens += len(
+                    pre_scheduler_output.scheduled_spec_decode_tokens.get(
+                        req_id, []))
+
+            # Pop previous placeholder tokens and append sampled tokens to req_state unconditionally
+            num_to_pop = min(pre_num_placeholder_tokens, len(req_state.output_token_ids))
+            for j in range(num_to_pop):
+                req_state.output_token_ids.pop()
+            req_state.output_token_ids.extend(sampled_ids)
+
+            # If request not active in the *current* batch (e.g. finished or evicted), skip updating input_batch.
             if req_id not in self.input_batch.req_id_to_index:
                 continue
 
             req_idx = self.input_batch.req_id_to_index[req_id]
             assert req_state is self.requests[
                 req_id], "The req_state should be valid and identical"
-
-            # Updated on previous execute
-            pre_num_placeholder_tokens = 1
-            assert pre_scheduler_output is not None
-            pre_num_placeholder_tokens += len(
-                pre_scheduler_output.scheduled_spec_decode_tokens.get(
-                    req_id, []))
 
             end_idx = self.input_batch.num_tokens_no_spec[req_idx]
             num_sampled_tokens = min(len(sampled_ids),
@@ -1497,10 +1502,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 req_idx] = start_idx + num_sampled_tokens
             self.input_batch.num_tokens[
                 req_idx] = start_idx + num_sampled_tokens
-            # Replace previous placeholder
-            for j in range(pre_num_placeholder_tokens):
-                req_state.output_token_ids.pop()
-            req_state.output_token_ids.extend(sampled_ids)
 
     def _update_placeholder(
             self,
@@ -2296,12 +2297,16 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             # limit once n grows (e.g. spec decode with max_num_seqs=16:
             # [128, 62080] bf16 = 37.9M -> CompileTimeScopedVmemOom).
             # Gather in fixed-size row chunks so each gather stays small.
+            # Safe-clip negative sentinel indices (-1 from padded request slots)
+            # to prevent TPU DMA address translation faults and hardware halt.
+            max_idx = jnp.maximum(local_array.shape[0] - 1, 0)
+            safe_indices = jnp.clip(local_indices, 0, max_idx)
             chunk = 32
-            n = local_indices.shape[0]
+            n = safe_indices.shape[0]
             if n <= chunk or local_array.ndim < 2:
-                return local_array[local_indices]
+                return local_array[safe_indices]
             num_pads = (-n) % chunk
-            idx = jnp.pad(local_indices, (0, num_pads)).reshape(-1, chunk)
+            idx = jnp.pad(safe_indices, (0, num_pads)).reshape(-1, chunk)
             out = jax.lax.map(lambda ix: local_array[ix], idx)
             return out.reshape(-1, *local_array.shape[1:])[:n]
 
@@ -2523,17 +2528,18 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
                 if not spec_decode_enabled:
                     # Treat as normal decode: substitute 1 token
-                    assert num_scheduled_tokens_per_req[i] == 1, (
-                        f"Expected 1 token for normal decode request {req_id}, "
-                        f"but got {num_scheduled_tokens_per_req[i]}")
+                    if num_scheduled_tokens_per_req[i] > 1:
+                        # Request is recomputing/prefilling tokens after preemption
+                        continue
                     token_in_tpu_cur_input_indices_list.append(acc_cur_len - 1)
                     token_in_tpu_pre_next_tokens_indices_list.append(
                         self._pre_async_results.
                         placeholder_req_id_to_index[req_id])
                 else:
                     max_num_spec_tokens = self.speculative_config.num_speculative_tokens
-                    assert num_scheduled_tokens_per_req[
-                        i] <= max_num_spec_tokens + 1
+                    if num_scheduled_tokens_per_req[i] > max_num_spec_tokens + 1:
+                        # Request is recomputing/prefilling tokens after preemption
+                        continue
                     idx = self._pre_async_results.placeholder_req_id_to_index[
                         req_id]
 
@@ -2565,7 +2571,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         padded_token_in_tpu_pre_next_tokens_indices = np.pad(
             token_in_tpu_pre_next_tokens_indices, (0, idx_pad_len),
             mode='constant',
-            constant_values=-1).astype(np.int32)
+            constant_values=0).astype(np.int32)
         placeholder_num = np.array([len(token_in_tpu_cur_input_indices)
                                     ]).astype(np.int32)
 
@@ -2992,6 +2998,35 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                         axis=0,
                         out=block_tables_view[req_offset:req_offset +
                                               _num_reqs])
+
+            # SWA slot remapping when compact SWA sizing is active (Vectorized Host Path)
+            if getattr(self.kv_cache_manager, "_swa_num_blocks", None) is not None:
+                if kv_cache_gid < len(self.kv_cache_config.kv_cache_groups):
+                    group_spec = self.kv_cache_config.kv_cache_groups[kv_cache_gid].kv_cache_spec
+                    sliding_window = getattr(group_spec, "sliding_window", None)
+                    if isinstance(sliding_window, (int, float)) and sliding_window > 0:
+                        block_size = getattr(group_spec, "block_size", self.cache_config.block_size)
+                        max_num_batched = getattr(self.scheduler_config, "max_num_batched_tokens", 512)
+                        extra_tokens = 0
+                        if self.speculative_config:
+                            extra_tokens = max(getattr(self.speculative_config, "num_spec_prefill_tokens", 0) - 1, 0)
+                        blocks_per_window = common_utils.get_swa_blocks_per_req(
+                            int(sliding_window), block_size, max_num_batched, extra_tokens,
+                            max_model_len=self.max_model_len)
+
+                        for dp_rank in range(dp_size):
+                            _num_reqs = num_req_per_dp_rank[dp_rank]
+                            if _num_reqs == 0:
+                                continue
+                            req_offset = dp_rank * max_num_reqs_per_dp_rank
+                            view_slice = block_tables_view[req_offset : req_offset + _num_reqs]
+                            mask = view_slice > 0
+                            if np.any(mask):
+                                num_cols = view_slice.shape[1]
+                                req_ids = (req_offset + np.arange(_num_reqs, dtype=view_slice.dtype))[:, None]
+                                col_ids = np.arange(num_cols, dtype=view_slice.dtype)[None, :]
+                                remapped = req_ids * blocks_per_window + (col_ids % blocks_per_window) + 1
+                                view_slice[:] = np.where(mask, remapped, 0)
 
             if pcp_size > 1:
                 # PCP fuses the request's head+tail chunks into one

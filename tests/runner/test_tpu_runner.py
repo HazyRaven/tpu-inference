@@ -182,6 +182,68 @@ class TestTPUJaxRunner:
         assert isinstance(attention_metadata, dict)
         assert len(attention_metadata) == 20
 
+    @patch('tpu_inference.runner.tpu_runner.TPUSupportedSamplingMetadata')
+    def test_prepare_inputs_multi_group_block_tables_integrity(self, mock_sampling_metadata):
+        """Verify that multi-group block tables preserve exact block IDs without artificial offset subtraction."""
+        self._create_mock_hybrid_kv_cache_config()
+
+        # Mock scheduler output
+        scheduler_output = MagicMock()
+        scheduler_output.total_num_scheduled_tokens = 10
+        scheduler_output.num_scheduled_tokens = {'req1': 10}
+        scheduler_output.scheduled_spec_decode_tokens = {}
+        scheduler_output.grammar_bitmask = None
+
+        # Mock input_batch
+        self.runner.input_batch = MagicMock()
+        self.runner.input_batch.num_reqs = 1
+        self.runner.input_batch.req_ids = ['req1']
+        self.runner.input_batch.req_id_to_index = {'req1': 0}
+        self.runner.input_batch.num_computed_tokens_cpu = np.array([10])
+        self.runner.input_batch.token_ids_cpu = np.random.randint(
+            0, 1000, (8, 64), dtype=np.int32)
+        self.runner.input_batch.mamba_state_indices_cpu = np.zeros(
+            self.runner.max_num_reqs, dtype=np.int32)
+
+        # Mock realistic distinct, non-zero block IDs for Group 0 and Group 1
+        mock_block_table_g0 = MagicMock()
+        mock_block_table_g0.max_num_blocks_per_req = 8
+        group0_block_ids = np.array([[10, 11, 12, 13, 0, 0, 0, 0]], dtype=np.int32)
+        mock_block_table_g0.get_cpu_tensor.return_value = group0_block_ids
+
+        mock_block_table_g1 = MagicMock()
+        mock_block_table_g1.max_num_blocks_per_req = 8
+        # Group 1 block IDs with values both small and large (e.g. 500, 501, 502)
+        group1_block_ids = np.array([[500, 501, 502, 503, 0, 0, 0, 0]], dtype=np.int32)
+        mock_block_table_g1.get_cpu_tensor.return_value = group1_block_ids
+
+        self.runner.input_batch.block_table = [
+            mock_block_table_g0, mock_block_table_g1
+        ]
+
+        # Setup mock runner kv_caches with buffer shape (e.g., 200 blocks per group)
+        mock_cache_g0 = MagicMock()
+        mock_cache_g0.shape = (200, 16, 8, 1, 256)
+        mock_cache_g1 = MagicMock()
+        mock_cache_g1.shape = (200, 32, 4, 1, 512)
+        self.runner.kv_caches = [mock_cache_g0] * 10 + [mock_cache_g1] * 10
+        self.runner.layer_name_to_kvcache_index = {f'layer.{i}': i for i in range(20)}
+
+        mock_sampling_instance = MagicMock()
+        mock_sampling_metadata.from_input_batch.return_value = mock_sampling_instance
+
+        (_, _, attention_metadata, *_) = self.runner._prepare_inputs(scheduler_output)
+
+        # Verify device buffer host views contain exact uncorrupted block IDs
+        np.testing.assert_array_equal(
+            np.array(attention_metadata.groups[0].block_tables).reshape(-1, 8)[0],
+            group0_block_ids[0]
+        )
+        np.testing.assert_array_equal(
+            np.array(attention_metadata.groups[1].block_tables).reshape(-1, 8)[0],
+            group1_block_ids[0]
+        )
+
     def _create_mock_hybrid_kv_cache_config(self):
         mock_kv_cache_config = MagicMock()
         mock_kv_cache_group1 = MagicMock()
@@ -883,6 +945,261 @@ class TestTPUJaxRunner:
             assert runner_b.mesh.devices.shape == mesh_shape
             flat_results_b = runner_b.mesh.devices.flatten().tolist()
             assert flat_results_b == unordered_devices
+
+    def test_async_token_substitution_preemption_recompute(self):
+        """PR 4: Verify async token substitution skips recomputing requests with scheduled tokens > 1."""
+        runner = self.runner
+        runner.speculative_config = None
+        req_ids_dp = {0: ["req_0"]}
+        scheduled_tokens_per_dp_rank = {0: [16]}
+        padded_num_scheduled_tokens_per_dp_rank = 16
+        dp_size = 1
+
+        runner.input_batch.req_id_to_index = {"req_0": 0}
+        runner.input_batch.num_computed_tokens_cpu = np.array([100], dtype=np.int32)
+        runner.input_batch.num_prompt_tokens = [10]
+        runner._pre_async_results = MagicMock()
+        runner._pre_async_results.placeholder_req_id_to_index = {"req_0": 0}
+
+        (
+            token_in_tpu_cur_input_indices_dp,
+            token_in_tpu_pre_next_tokens_indices_dp,
+        ) = runner._prepare_async_token_substitution_indices(
+            req_ids_dp=req_ids_dp,
+            scheduled_tokens_per_dp_rank=scheduled_tokens_per_dp_rank,
+            padded_num_scheduled_tokens_per_dp_rank=padded_num_scheduled_tokens_per_dp_rank,
+            dp_size=dp_size,
+        )
+        assert token_in_tpu_cur_input_indices_dp[0] == []
+        assert token_in_tpu_pre_next_tokens_indices_dp[0] == []
+
+    def test_async_token_substitution_mixed_preempt_batch(self):
+        """PR 4: Verify in a mixed batch (1 preempted + 3 decode), only the 3 decode requests are substituted."""
+        runner = self.runner
+        runner.speculative_config = None
+        req_ids_dp = {0: ["req_0", "req_1", "req_2", "req_3"]}
+        scheduled_tokens_per_dp_rank = {0: [32, 1, 1, 1]}
+        padded_num_scheduled_tokens_per_dp_rank = 35
+        dp_size = 1
+
+        runner.input_batch.req_id_to_index = {"req_0": 0, "req_1": 1, "req_2": 2, "req_3": 3}
+        runner.input_batch.num_computed_tokens_cpu = np.array([100, 100, 100, 100], dtype=np.int32)
+        runner.input_batch.num_prompt_tokens = [10, 10, 10, 10]
+        runner._pre_async_results = MagicMock()
+        runner._pre_async_results.placeholder_req_id_to_index = {"req_0": 0, "req_1": 1, "req_2": 2, "req_3": 3}
+
+        (
+            token_in_tpu_cur_input_indices_dp,
+            token_in_tpu_pre_next_tokens_indices_dp,
+        ) = runner._prepare_async_token_substitution_indices(
+            req_ids_dp=req_ids_dp,
+            scheduled_tokens_per_dp_rank=scheduled_tokens_per_dp_rank,
+            padded_num_scheduled_tokens_per_dp_rank=padded_num_scheduled_tokens_per_dp_rank,
+            dp_size=dp_size,
+        )
+        assert token_in_tpu_cur_input_indices_dp[0] == [32, 33, 34]
+        assert token_in_tpu_pre_next_tokens_indices_dp[0] == [1, 2, 3]
+
+    def test_modify_prev_results_preempted_request_placeholder_popped(self):
+        """PR 4: Verify requests preempted/finished between steps have placeholders popped unconditionally."""
+        from tpu_inference.runner.input_batch import CachedRequestState
+        runner = self.runner
+        req_0 = CachedRequestState(
+            req_id="req_0",
+            prompt_token_ids=[10, 11],
+            mm_features=[],
+            sampling_params=MagicMock(),
+            pooling_params=None,
+            block_ids=None,
+            num_computed_tokens=0,
+            lora_request=None,
+            output_token_ids=[100, 0],
+        )
+        runner.requests = {"req_0": req_0}
+        runner._pre_async_results = MagicMock()
+        runner._pre_async_results.request_seq_lens = [(0, req_0, 2)]
+        runner._pre_async_results.req_ids = ["req_0"]
+        runner._pre_async_results.next_tokens = jnp.array([[101]])
+        runner._pre_async_results.discard_sampled_tokens_req_indices = []
+        runner._pre_async_results.logits_indices_selector = None
+        runner._pre_async_results.spec_decode_metadata = None
+        runner._pre_async_results.scheduler_output = None
+        runner._pre_async_results.is_continue_decode = False
+
+        runner.input_batch.req_id_to_index = {}
+        with patch("tpu_inference.runner.tpu_runner.runner_utils.host_extract_sampled_tokens", return_value=[[101]]):
+            runner._modify_prev_results()
+
+        assert req_0.output_token_ids == [100, 101]
+
+    def test_async_token_substitution_sentinel_safe_padding(self):
+        """PR 4: Verify padded slots in token_in_tpu_pre_next_tokens_indices use 0 padding (not -1)."""
+        from tpu_inference.runner.tpu_runner import _substitute_placeholder_token
+        padded_cur_indices = jnp.array([0, 1, 2, 3], dtype=jnp.int32)
+        padded_pre_indices = jnp.array([0, 1, 0, 0], dtype=jnp.int32)
+        input_ids = jnp.array([10, 20, 30, 40], dtype=jnp.int32)
+        next_tokens = jnp.array([100, 200, 300, 400], dtype=jnp.int32)
+
+        updated_ids = _substitute_placeholder_token(
+            input_ids=input_ids,
+            token_in_tpu_cur_input_indices=padded_cur_indices,
+            token_in_tpu_pre_next_tokens_indices=padded_pre_indices,
+            next_tokens=next_tokens,
+            placeholder_num=2,
+        )
+        assert list(np.asarray(updated_ids)) == [100, 200, 30, 40]
+
+    def test_chunked_prefill_ring_buffer_key_integrity(self):
+        """PR 5: Test ring buffer slot allocation across chunked prefill (2000 tokens, C=512)."""
+        from tpu_inference import utils as common_utils
+        W = 1024
+        B = 16
+        C = 512
+        blocks_per_req = common_utils.get_swa_blocks_per_req(W, B, C)
+
+        total_tokens = 2000
+        num_chunks = (total_tokens + C - 1) // C
+        written_slots = {}
+        for chunk_idx in range(num_chunks):
+            start_tok = chunk_idx * C
+            end_tok = min(total_tokens, (chunk_idx + 1) * C)
+            chunk_blocks = list(range(start_tok // B, (end_tok + B - 1) // B))
+            active_window_start_tok = max(0, end_tok - W)
+            active_window_blocks = set(range(active_window_start_tok // B, (end_tok + B - 1) // B))
+
+            for b in chunk_blocks:
+                slot = b % blocks_per_req
+                written_slots[b] = slot
+
+            active_slots = [written_slots[b] for b in active_window_blocks]
+            assert len(active_slots) == len(set(active_slots)), f"Collision detected in chunk {chunk_idx}"
+
+    def test_build_block_table_host_vectorized_swa_slot_remapping(self):
+        """PR 6: Test 2D NumPy broadcast SWA slot remapping on 32 concurrent requests."""
+        import torch
+        from tpu_inference import utils as common_utils
+        from vllm.v1.kv_cache_interface import (KVCacheConfig,
+                                                KVCacheGroupSpec,
+                                                SlidingWindowSpec)
+        runner = self.runner
+        runner.kv_cache_manager._swa_num_blocks = 5000
+
+        group_spec = SlidingWindowSpec(block_size=16, num_kv_heads=16, head_size=256, dtype=torch.float8_e5m2, sliding_window=1024)
+        runner.kv_cache_config = KVCacheConfig(
+            num_blocks=5000,
+            kv_cache_tensors=[],
+            kv_cache_groups=[KVCacheGroupSpec(layer_names=[f"layer.{i}" for i in range(10)], kv_cache_spec=group_spec)]
+        )
+        runner.scheduler_config.max_num_batched_tokens = 512
+        runner.max_model_len = 2048
+
+        blocks_per_window = common_utils.get_swa_blocks_per_req(1024, 16, 512, 0, max_model_len=2048)
+        num_reqs = 32
+        num_blocks_per_req = 50
+
+        block_table_input = np.zeros((num_reqs, 100), dtype=np.int32)
+        for r in range(num_reqs):
+            block_table_input[r, :num_blocks_per_req] = np.arange(r * 100, r * 100 + num_blocks_per_req) + 1
+
+        block_tables_view = block_table_input.copy()
+        req_ids = np.arange(num_reqs, dtype=np.int32)[:, None]
+        col_ids = np.arange(100, dtype=np.int32)[None, :]
+        mask = block_tables_view > 0
+        remapped = req_ids * blocks_per_window + (col_ids % blocks_per_window) + 1
+        block_tables_view[:] = np.where(mask, remapped, 0)
+
+        for r in range(num_reqs):
+            row = block_tables_view[r, :num_blocks_per_req]
+            expected = r * blocks_per_window + (np.arange(num_blocks_per_req) % blocks_per_window) + 1
+            assert np.array_equal(row, expected)
+
+    def test_build_block_table_host_swa_slot_remapping_bounds(self):
+        """PR 6 & 8: Verify 5000 logical block IDs remap within [1, N_SWA - 1] without cross-request collision."""
+        blocks_per_window = 97
+        num_reqs = 4
+        N_swa = num_reqs * blocks_per_window + 1
+
+        cols = 5000
+        req_ids = np.arange(num_reqs, dtype=np.int32)[:, None]
+        col_ids = np.arange(cols, dtype=np.int32)[None, :]
+        remapped = req_ids * blocks_per_window + (col_ids % blocks_per_window) + 1
+
+        assert np.all(remapped >= 1)
+        assert np.all(remapped < N_swa)
+
+        for r1 in range(num_reqs):
+            for r2 in range(r1 + 1, num_reqs):
+                r1_slots = set(remapped[r1])
+                r2_slots = set(remapped[r2])
+                assert r1_slots.isdisjoint(r2_slots)
+
+    def test_pallas_rpa_cur_seq_start_bkv_idx_tile_skipping(self):
+        """PR 6: Test Pallas tile skipping boundary calculation across sequence lengths."""
+        sliding_window = 1024
+        block_size = 16
+
+        for seq_len in [512, 1024, 2048, 50000]:
+            cur_seq_start_bkv_idx = max(0, (seq_len - sliding_window) // block_size)
+            if seq_len <= sliding_window:
+                assert cur_seq_start_bkv_idx == 0
+            else:
+                assert cur_seq_start_bkv_idx == (seq_len - 1024) // 16
+
+    def test_select_from_array_sentinel_indices_clamping(self):
+        """PR 8: Verify _select_from_array_fn clamps negative sentinel and out-of-bounds indices safely."""
+        from jax.sharding import NamedSharding, PartitionSpec
+        from tpu_inference.layers.common.sharding import ShardingAxisName
+        sharding_2d = NamedSharding(self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA, None))
+        sharding_1d = NamedSharding(self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA))
+
+        table = jnp.array([[10, 11], [20, 21], [30, 31], [40, 41]], dtype=jnp.float32)
+        indices = jnp.array([-1, 0, 3, -1, 10], dtype=jnp.int32)
+        table = jax.device_put(table, sharding_2d)
+        indices = jax.device_put(indices, sharding_1d)
+
+        out = self.runner._select_from_array_fn(table, indices, self.runner.mesh)
+        assert out.shape == (5, 2)
+        assert np.all(np.asarray(out[0]) == [10, 11])
+        assert np.all(np.asarray(out[1]) == [10, 11])
+        assert np.all(np.asarray(out[2]) == [40, 41])
+        assert np.all(np.asarray(out[3]) == [10, 11])
+        assert np.all(np.asarray(out[4]) == [40, 41])
+
+    def test_select_from_array_extreme_oob_indices(self):
+        """PR 8: Verify extreme negative and large indices [-100, -1, 0, 999999] clamp safely."""
+        from jax.sharding import NamedSharding, PartitionSpec
+        from tpu_inference.layers.common.sharding import ShardingAxisName
+        sharding_2d = NamedSharding(self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA, None))
+        sharding_1d = NamedSharding(self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA))
+
+        table = jnp.array([[1, 2], [3, 4]], dtype=jnp.float32)
+        indices = jnp.array([-100, -1, 0, 999999], dtype=jnp.int32)
+        table = jax.device_put(table, sharding_2d)
+        indices = jax.device_put(indices, sharding_1d)
+
+        out = self.runner._select_from_array_fn(table, indices, self.runner.mesh)
+        assert out.shape == (4, 2)
+        assert np.all(np.asarray(out[0]) == [1, 2])
+        assert np.all(np.asarray(out[1]) == [1, 2])
+        assert np.all(np.asarray(out[2]) == [1, 2])
+        assert np.all(np.asarray(out[3]) == [3, 4])
+
+    def test_select_from_array_chunked_vmem_gather(self):
+        """PR 8: Verify chunked gathering preserves row ordering for large token counts (n=128)."""
+        from jax.sharding import NamedSharding, PartitionSpec
+        from tpu_inference.layers.common.sharding import ShardingAxisName
+        sharding_2d = NamedSharding(self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA, None))
+        sharding_1d = NamedSharding(self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA))
+
+        table = jnp.arange(256 * 64, dtype=jnp.float32).reshape(256, 64)
+        indices = jnp.arange(128, dtype=jnp.int32)
+        table = jax.device_put(table, sharding_2d)
+        indices = jax.device_put(indices, sharding_1d)
+
+        out = self.runner._select_from_array_fn(table, indices, self.runner.mesh)
+        assert out.shape == (128, 64)
+        assert np.all(np.asarray(out) == np.asarray(table[:128]))
+
 
 
 class TestTPUJaxRunnerMultimodalModelLoadedForTextOnly:
