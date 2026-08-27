@@ -264,12 +264,14 @@ def get_kv_cache_shape(
     actual_num_kv_heads,
     actual_head_dim,
     kv_dtype,
+    single_projection: bool = False,
 ):
     kv_packing = get_dtype_packing(kv_dtype)
+    multiplier = 1 if single_projection else 2
     return (
         total_num_pages,
         page_size,
-        align_to(actual_num_kv_heads * 2, kv_packing) // kv_packing,
+        align_to(actual_num_kv_heads * multiplier, kv_packing) // kv_packing,
         kv_packing,
         align_to(actual_head_dim, 128),
     )

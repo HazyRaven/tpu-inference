@@ -59,7 +59,8 @@ def get_kv_cache_shape_with_mesh(mesh: Mesh,
                                  actual_num_kv_heads: int,
                                  actual_head_dim: int,
                                  kv_dtype: any,
-                                 use_mla: bool = False):
+                                 use_mla: bool = False,
+                                 single_projection: bool = False):
     """Gets the KV cache shape based on the mesh configuration.
 
     This function scales block_size by the CONTEXT (DCP, PCP) axis and num_heads by duplicate kv heads.
@@ -96,7 +97,8 @@ def get_kv_cache_shape_with_mesh(mesh: Mesh,
         shape = list(
             get_kv_cache_shape_fn(total_num_pages, physical_block_size,
                                   actual_num_kv_heads // model_cnt,
-                                  actual_head_dim, kv_dtype))
+                                  actual_head_dim, kv_dtype,
+                                  single_projection=single_projection))
         shape[2] *= model_cnt
     return tuple(shape)
 
@@ -146,12 +148,13 @@ def create_kv_caches(
     layer_names: List[str],
     cache_dtype: jnp.dtype = DEFAULT_KV_CACHE_DTYPE,
     use_mla: bool = False,
+    single_projection: bool = False,
 ) -> List[jax.Array]:
     """
     Creates a list of KV cache where each array mapps to single attention layer.
 
     The shape of the KV cache per layer is:
-    (num_blocks, block_size, cdiv(num_kv_heads * 2, packing), packing, head_dim)
+    (num_blocks, block_size, cdiv(num_kv_heads * (1 if single_projection else 2), packing), packing, head_dim)
     where packing = (32 // dtype bits)
 
     Args:
@@ -162,6 +165,8 @@ def create_kv_caches(
         mesh: The mesh to shard the KV caches across.
         layer_names: The names of the decoder layers in the model.
         cache_dtype: The datatype of KV cache.
+        use_mla: Whether to use MLA format.
+        single_projection: Whether to allocate 1 projection per head instead of 2 (K == V).
 
     Returns:
         A list of KV caches, one per each decoder layer in the model.
@@ -172,7 +177,8 @@ def create_kv_caches(
 
     cache_shape = get_kv_cache_shape_with_mesh(mesh, num_blocks, block_size,
                                                num_kv_heads, head_size,
-                                               cache_dtype, use_mla)
+                                               cache_dtype, use_mla,
+                                               single_projection=single_projection)
 
     # num_blocks --> shard by data batch
     # block_size --> shard by context
@@ -206,7 +212,7 @@ def create_kv_cache_of_shape(
 
 
 def get_attention_page_size_bytes(mesh, block_size, num_kv_heads, head_size,
-                                  dtype, use_mla) -> int:
+                                  dtype, use_mla, single_projection: bool = False) -> int:
     jax_dtype = to_jax_dtype(dtype)
     bits = dtypes.itemsize_bits(jax_dtype)
     kv_cache_shape = get_kv_cache_shape_with_mesh(
@@ -217,5 +223,6 @@ def get_attention_page_size_bytes(mesh, block_size, num_kv_heads, head_size,
         actual_head_dim=head_size,
         kv_dtype=jax_dtype,
         use_mla=use_mla,
+        single_projection=single_projection,
     )
     return int(bits * np.prod(kv_cache_shape)) // 8

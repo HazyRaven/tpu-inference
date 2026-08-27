@@ -146,6 +146,7 @@ def get_kv_cache_shape(
     actual_head_dim,
     kv_dtype,
     kv_layout: configs.KVLayout | None = None,
+    single_projection: bool = False,
 ):
     if kv_layout is None:
         if envs.USE_BATCHED_RPA_SEQ_ON_LANE:
@@ -155,10 +156,11 @@ def get_kv_cache_shape(
     num_lanes = pltpu.get_tpu_info().num_lanes
     num_sublanes = pltpu.get_tpu_info().num_sublanes
     kv_packing = utils.get_dtype_packing(kv_dtype)
+    multiplier = 1 if single_projection else 2
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         return (
             total_num_pages,
-            actual_num_kv_heads * 2,
+            actual_num_kv_heads * multiplier,
             utils.align_to(actual_head_dim, num_sublanes * kv_packing) //
             kv_packing,
             kv_packing,
