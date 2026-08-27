@@ -581,8 +581,10 @@ class KVCacheManager:
         # Use FullAttentionSpec for each layer
         # TODO(pooyam): Is it possible to merge the logic for vllm and non-vllm models?
         model_config = self.runner.model_config
-        text_config = getattr(model_config, "hf_text_config",
-                              getattr(model_config, "hf_config", None))
+        text_config = getattr(
+            model_config, "hf_text_config",
+            getattr(getattr(model_config, "hf_config", None), "text_config",
+                    getattr(model_config, "hf_config", None)))
         if self.use_mla:
             # Individually pad the RopE and latents
             qk_rope_head_dim = getattr(text_config, "qk_rope_head_dim", 0)
@@ -763,7 +765,10 @@ class KVCacheManager:
                     head_size = common_utils.get_padded_head_dim(
                         attn_module.head_size)
 
-                    hf_text_cfg = getattr(self.runner.model_config, "hf_text_config", None)
+                    hf_text_cfg = getattr(
+                        self.runner.model_config, "hf_text_config",
+                        getattr(getattr(self.runner.model_config, "hf_config", None), "text_config",
+                                getattr(self.runner.model_config, "hf_config", None)))
                     single_proj = ((attn_module.sliding_window is None or attn_module.sliding_window <= 0) and getattr(hf_text_cfg, "attention_k_eq_v", False))
                     if attn_module.sliding_window is not None and attn_module.sliding_window > 0:
                         kv_cache_spec[
@@ -1725,6 +1730,16 @@ class KVCacheManager:
                     )
                     jax.block_until_ready(self.runner.kv_caches)
         else:
+            # Determine whether kv_cache_slices contains slices for all groups or active groups only
+            all_groups_layer_count = 0
+            for group in self.runner.kv_cache_config.kv_cache_groups:
+                group_layer_indices = list(dict.fromkeys(
+                    self.runner.layer_name_to_kvcache_index[name] for name in group.layer_names
+                    if name in self.runner.layer_name_to_kvcache_index
+                ))
+                all_groups_layer_count += len(group_layer_indices) if group_layer_indices else len(group.layer_names)
+            slices_cover_all_groups = (len(kv_cache_slices) == all_groups_layer_count)
+
             slice_offset = 0
             for gid, group in enumerate(self.runner.kv_cache_config.kv_cache_groups):
                 if gid >= len(nested_block_ids):
@@ -1736,11 +1751,18 @@ class KVCacheManager:
                     if name in self.runner.layer_name_to_kvcache_index
                 ))
                 num_group_layers = len(group_layer_indices) if group_layer_indices else len(group.layer_names)
-                group_slices = kv_cache_slices[slice_offset:slice_offset + num_group_layers]
-                slice_offset += num_group_layers
 
-                if not g_block_ids or not group_layer_indices:
-                    continue
+                if slices_cover_all_groups:
+                    group_slices = kv_cache_slices[slice_offset:slice_offset + num_group_layers]
+                    slice_offset += num_group_layers
+                    if not g_block_ids or not group_layer_indices:
+                        continue
+                else:
+                    if not g_block_ids or not group_layer_indices:
+                        continue
+                    group_slices = kv_cache_slices[slice_offset:slice_offset + num_group_layers]
+                    slice_offset += num_group_layers
+
                 group_kv_caches = [self.runner.kv_caches[idx] for idx in group_layer_indices]
                 if not group_slices or len(group_slices) != len(group_kv_caches):
                     continue

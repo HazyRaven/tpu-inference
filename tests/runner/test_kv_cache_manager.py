@@ -2629,5 +2629,94 @@ class TestKVCacheManager:
         for cache in self.runner.kv_caches:
             assert cache.shape[0] == 32
 
+    def test_insert_request_with_kv_cache_ragged_empty_leading_group_alignment(self):
+        """Verify that when leading groups have empty block_ids, slice_offset remains synchronized with non-empty groups."""
+        groups = [
+            KVCacheGroupSpec(
+                layer_names=[f"layer.{i}" for i in range(10)],
+                kv_cache_spec=FullAttentionSpec(block_size=32, num_kv_heads=4, head_size=512, dtype=torch.float8_e5m2)
+            ),
+            KVCacheGroupSpec(
+                layer_names=[f"layer.{10 + i}" for i in range(50)],
+                kv_cache_spec=SlidingWindowSpec(block_size=16, num_kv_heads=16, head_size=256, dtype=torch.float8_e5m2, sliding_window=1024)
+            ),
+        ]
+        self.runner.kv_cache_config = KVCacheConfig(num_blocks=100, kv_cache_tensors=[], kv_cache_groups=groups)
+        self.runner.kv_caches = (
+            [jnp.zeros((100, 32, 8, 1, 512), dtype=jnp.uint8) for _ in range(10)] +
+            [jnp.zeros((100, 16, 32, 1, 256), dtype=jnp.uint8) for _ in range(50)]
+        )
+        self.runner.layer_name_to_kvcache_index = {f"layer.{i}": i for i in range(60)}
+
+        # Slices extracted from get_kv_cache_for_block_ids([[], [5, 6]]) -> exactly 50 slices (for group 1 only)
+        slices = [jnp.ones((32, 32, 1, 256), dtype=jnp.uint8) for _ in range(50)]
+        ragged_block_ids = [[], [5, 6]]
+
+        mock_sampling_params = MagicMock()
+        mock_sampling_params.sampling_type = SamplingType.GREEDY
+        mock_sampling_params.top_p = 1.0
+        mock_sampling_params.top_k = -1
+        mock_sampling_params.min_tokens = None
+        mock_sampling_params.logprobs = None
+        mock_sampling_params.prompt_logprobs = None
+        mock_sampling_params.logit_bias = None
+        mock_sampling_params.allowed_token_ids = set()
+        mock_sampling_params.bad_words_token_ids = None
+        mock_sampling_params.all_stop_token_ids = set()
+
+        mock_req = MagicMock(
+            spec=Request,
+            request_id="req_ragged_leading_empty",
+            prompt_token_ids=[1]*32,
+            all_token_ids=[1]*32,
+            output_token_ids=[1],
+            sampling_params=mock_sampling_params,
+            num_computed_tokens=32,
+            lora_request=None,
+            mm_features=[],
+        )
+        self.runner.kv_cache_manager.insert_request_with_kv_cache(mock_req, slices, ragged_block_ids)
+
+        # Verify group 0 layers remain untouched (all 0)
+        for i in range(10):
+            assert jnp.all(self.runner.kv_caches[i] == 0)
+
+        # Verify group 1 layers received slices at blocks 5..6 (all 1)
+        for i in range(10, 60):
+            assert jnp.all(self.runner.kv_caches[i][5:7] == 1)
+
+    def test_compilation_single_projection_with_hf_config_text_config(self):
+        """Verify that single_projection activates on compilation path when attention_k_eq_v is inside hf_config.text_config."""
+        mock_text_cfg = MagicMock(attention_k_eq_v=True)
+        mock_hf_config = MagicMock(text_config=mock_text_cfg)
+        mock_model_config = MagicMock(hf_config=mock_hf_config)
+        del mock_model_config.hf_text_config  # Ensure hf_text_config does not exist directly
+        self.runner.model_config = mock_model_config
+
+        full_attn = MagicMock()
+        full_attn.attn_type = AttentionType.DECODER
+        full_attn.sliding_window = None
+        full_attn.num_kv_heads = 4
+        full_attn.head_size = 512
+        full_attn.kv_sharing_target_layer_name = None
+
+        swa_attn = MagicMock()
+        swa_attn.attn_type = AttentionType.DECODER
+        swa_attn.sliding_window = 1024
+        swa_attn.num_kv_heads = 16
+        swa_attn.head_size = 256
+        swa_attn.kv_sharing_target_layer_name = None
+
+        mock_layers = {"full_layer": full_attn, "swa_layer": swa_attn}
+        self.runner.vllm_config.compilation_config.static_forward_context = {"dummy": 1}
+
+        with patch("tpu_inference.runner.kv_cache_manager.get_layers_from_vllm_config", return_value=mock_layers):
+            with patch.object(self.runner.kv_cache_manager, "_maybe_set_compact_swa_num_blocks_override"):
+                specs = self.runner.get_kv_cache_spec()
+
+        assert specs["full_layer"].single_projection is True
+        assert specs["swa_layer"].single_projection is False
+
+
 
 
