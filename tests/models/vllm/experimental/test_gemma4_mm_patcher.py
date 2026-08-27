@@ -116,3 +116,46 @@ def test_patched_forward_skips_ple_without_inputs_embeds():
     model.language_model.model.get_per_layer_inputs.assert_not_called()
     assert model.language_model.model.call_args.kwargs[
         'per_layer_inputs'] is None
+
+
+def test_gemma4_mm_compute_logits_no_tracer_leak():
+    """PR 8: Test that patched compute_logits constructs un-traced index tensors dynamically per call."""
+    model = _make_mock_gemma4()
+    model.config.text_config.suppress_token_ids = [2, 5]
+
+    def dummy_compute_logits(hidden_states, sampling_metadata=None):
+        batch_size = hidden_states.shape[0]
+        vocab_size = 10
+        return torch.zeros(batch_size, vocab_size)
+
+    model.language_model.compute_logits = dummy_compute_logits
+    apply_gemma4_mm_patches(model)
+
+    for b in [1, 4, 16]:
+        hidden_states = torch.randn(b, 64)
+        logits = model.compute_logits(hidden_states)
+        assert logits.shape == (b, 10)
+        assert torch.all(logits[:, 2] == -float("inf"))
+        assert torch.all(logits[:, 5] == -float("inf"))
+        assert torch.all(logits[:, 0] == 0)
+        assert torch.all(logits[:, 1] == 0)
+
+
+def test_gemma4_mm_multi_shape_jit_no_tracer_leak():
+    """PR 8: Verify alternating batch shapes 1 -> 4 -> 16 -> 1 does not leak tracers."""
+    model = _make_mock_gemma4()
+    model.config.text_config.suppress_token_ids = [3]
+
+    def dummy_compute_logits(hidden_states, sampling_metadata=None):
+        return torch.ones(hidden_states.shape[0], 20)
+
+    model.language_model.compute_logits = dummy_compute_logits
+    apply_gemma4_mm_patches(model)
+
+    for b in [1, 4, 16, 1]:
+        hidden_states = torch.randn(b, 32)
+        logits = model.compute_logits(hidden_states)
+        assert logits.shape == (b, 20)
+        assert torch.all(logits[:, 3] == -float("inf"))
+        assert torch.all(logits[:, 0] == 1.0)
+

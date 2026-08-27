@@ -121,6 +121,24 @@ def _ple_forward(
     return hidden_states
 
 
+def _patched_compute_logits(
+    self,
+    hidden_states: torch.Tensor,
+    sampling_metadata: object = None,
+) -> torch.Tensor:
+    """Patched compute_logits that dynamically constructs un-traced index tensors per call."""
+    logits = self.language_model.compute_logits(hidden_states, sampling_metadata)
+    suppress_token_ids = getattr(self.config.text_config, "suppress_token_ids", None)
+    if suppress_token_ids:
+        suppress_tensor = torch.tensor(
+            suppress_token_ids,
+            device=logits.device,
+            dtype=torch.long,
+        )
+        logits.index_fill_(-1, suppress_tensor, -float("inf"))
+    return logits
+
+
 def apply_gemma4_mm_patches(vllm_model: nn.Module) -> None:
     # Dropping the buffer makes embed_input_ids skip its
     # per_layer_embeddings[:n].copy_(...) block (guarded by
@@ -136,9 +154,10 @@ def apply_gemma4_mm_patches(vllm_model: nn.Module) -> None:
     vllm_model._tpu_ple_mask_token_ids = tuple(mask_token_ids)
 
     vllm_model.forward = MethodType(_ple_forward, vllm_model)
+    vllm_model.compute_logits = MethodType(_patched_compute_logits, vllm_model)
     logger.info(
-        "[gemma4-patch] Replaced per_layer_embeddings CUDA-graph buffer with "
-        "inline PLE computation in forward (mask_token_ids=%s).",
+        "[gemma4-patch] Replaced per_layer_embeddings CUDA-graph buffer and patched "
+        "compute_logits dynamically (mask_token_ids=%s).",
         mask_token_ids,
     )
 
@@ -146,10 +165,7 @@ def apply_gemma4_mm_patches(vllm_model: nn.Module) -> None:
 def maybe_apply_gemma4_mm_patches(vllm_model: nn.Module) -> None:
     if not isinstance(vllm_model, Gemma4ForConditionalGeneration):
         return
-    ple_dim = getattr(vllm_model.config.text_config,
-                      "hidden_size_per_layer_input", None)
-    if ple_dim is None or ple_dim <= 0:
-        # Variant without PLE (e.g. 26B/31B): per_layer_embeddings is None
-        # and the forward's buffer read is already skipped. Nothing to patch.
+    text_config = getattr(vllm_model.config, "text_config", None)
+    if text_config is None or getattr(text_config, "hidden_size_per_layer_input", None) is None:
         return
     apply_gemma4_mm_patches(vllm_model)
