@@ -307,6 +307,13 @@ def apply_qwix_quantization(
     kv_cache_dtype = vllm_config.cache_config.cache_dtype
 
     hf_config = vllm_config.model_config.hf_config
+    if hasattr(model_or_model_fn, "model") and hasattr(
+            model_or_model_fn.model, "num_mtp_layers") and getattr(
+                vllm_config, "speculative_config", None):
+        spec_config = getattr(vllm_config, "speculative_config", None)
+        if getattr(spec_config, "draft_model_config", None):
+            hf_config = spec_config.draft_model_config.hf_config
+
     if hasattr(hf_config, "text_config") and hasattr(hf_config.text_config,
                                                      "num_hidden_layers"):
         num_hidden_layers = hf_config.text_config.num_hidden_layers
@@ -354,6 +361,7 @@ def apply_qwix_quantization(
                 f"layer_types length ({len(layer_types)}) does not match "
                 f"num_hidden_layers ({num_hidden_layers})")
 
+        per_layer_config = getattr(text_config, "per_layer_config", {})
         for i in range(num_hidden_layers):
             layer_type = layer_types[i]
 
@@ -362,6 +370,17 @@ def apply_qwix_quantization(
             # utils.get_layer_kv_params).
             head_dim_original, kv_heads = utils.get_layer_kv_params(
                 text_config, layer_type)
+            if str(i) in per_layer_config:
+                layer_cfg = per_layer_config[str(i)]
+                if isinstance(layer_cfg, dict):
+                    head_dim_original = layer_cfg.get("head_dim", head_dim_original)
+                    kv_heads = layer_cfg.get("num_key_value_heads", kv_heads)
+            elif i in per_layer_config:
+                layer_cfg = per_layer_config[i]
+                if isinstance(layer_cfg, dict):
+                    head_dim_original = layer_cfg.get("head_dim", head_dim_original)
+                    kv_heads = layer_cfg.get("num_key_value_heads", kv_heads)
+
             head_size_list.append(
                 utils.get_padded_head_dim(head_dim_original or 0))
             num_kv_heads_list.append(

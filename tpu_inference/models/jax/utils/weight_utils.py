@@ -920,6 +920,10 @@ class JaxAutoWeightsLoader(AutoWeightsLoader):
                                       permute_dims=permute_dims,
                                       param_name=name))
 
+        if "skip_prefixes" in kwargs:
+            skip_prefixes = kwargs.pop("skip_prefixes")
+            if "ignore_unexpected_prefixes" not in kwargs:
+                kwargs["ignore_unexpected_prefixes"] = skip_prefixes
         super().__init__(model, **kwargs)
         # Book mark those already done processing, skip if visited.
         self._process_weights_after_loading_per_module = defaultdict(

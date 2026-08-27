@@ -846,6 +846,7 @@ class Gemma4Model(JaxModule):
             self.per_layer_input_scale = 0.0
             self.per_layer_projection_scale = 0.0
 
+        self.kv_share_map = compute_kv_share_map(text_config)
         self.start_layer, self.end_layer, self.layers = make_layers(
             text_config.num_hidden_layers,
             lambda layer_index: Gemma4DecoderLayer(
@@ -972,15 +973,22 @@ class Gemma4Model(JaxModule):
                 islice(self.layers, self.start_layer, self.end_layer)):
             layer_idx = i + self.start_layer
             layer_name = f"layer.{layer_idx}"
+            target_idx = self.kv_share_map.get(layer_idx, layer_idx)
+            target_layer_name = f"layer.{target_idx}"
             if isinstance(attention_metadata, dict):
-                layer_attn_metadata = attention_metadata[layer_name]
+                layer_attn_metadata = attention_metadata.get(
+                    layer_name, attention_metadata.get(target_layer_name))
+                if layer_attn_metadata is None:
+                    layer_attn_metadata = next(iter(attention_metadata.values())) if attention_metadata else None
             else:
                 layer_attn_metadata = attention_metadata
 
             if layer_name_to_kv_cache and layer_name in layer_name_to_kv_cache:
                 cache_idx = layer_name_to_kv_cache[layer_name]
+            elif layer_name_to_kv_cache and target_layer_name in layer_name_to_kv_cache:
+                cache_idx = layer_name_to_kv_cache[target_layer_name]
             else:
-                cache_idx = layer_idx
+                cache_idx = target_idx
 
             kv_cache = kv_caches[cache_idx]
             layer_per_input = (per_layer_inputs[:, layer_idx, :]

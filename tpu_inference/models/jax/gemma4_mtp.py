@@ -488,6 +488,16 @@ class Gemma4MultiTokenPredictor(JaxModule):
         layer_name_to_kv_cache: Optional[dict] = None,
     ) -> Tuple[List[jax.Array], jax.Array, jax.Array]:
         inputs_embeds = self.embed_input_ids(input_ids)
+        if inputs_embeds.shape[-1] != self.backbone_hidden_size:
+            inputs_embeds = jnp.pad(
+                inputs_embeds,
+                ((0, 0), (0, self.backbone_hidden_size - inputs_embeds.shape[-1])),
+            )
+        if hidden_states.shape[-1] != self.backbone_hidden_size:
+            hidden_states = jnp.pad(
+                hidden_states,
+                ((0, 0), (0, self.backbone_hidden_size - hidden_states.shape[-1])),
+            )
 
         combined = jnp.concatenate([inputs_embeds, hidden_states], axis=-1)
         hidden_states = self.pre_projection(combined)
@@ -631,13 +641,18 @@ class Gemma4MTPForCausalLM(JaxModule, LoadableWithIterator):
         self,
         kv_caches: List[jax.Array],
         input_ids: jax.Array,
-        hidden_states: jax.Array,
-        attention_metadata: AttentionMetadata,
+        hidden_states: Optional[jax.Array] = None,
+        attention_metadata: Optional[AttentionMetadata] = None,
         layer_name_to_kvcache_index: Optional[Sequence[Tuple[str,
                                                              int]]] = None,
         *args,
     ) -> Tuple[List[jax.Array], jax.Array, List[jax.Array],
                Optional[jax.Array]]:
+        if hidden_states is None:
+            hidden_states = jnp.zeros(
+                (input_ids.shape[0], self.model.backbone_hidden_size),
+                dtype=jnp.bfloat16)
+
         layer_name_to_kv_cache = (dict(layer_name_to_kvcache_index)
                                   if layer_name_to_kvcache_index else None)
 
