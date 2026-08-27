@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import dataclasses
+import math
 import os
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Any, List
 
 import jax
 import jax.numpy as jnp
@@ -30,8 +31,14 @@ from vllm.models.deepseek_v4.attention import (DeepseekV4Attention,
 from vllm.models.deepseek_v4.compressor import CompressorStateCache
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
-from vllm.v1.attention.backends.utils import (get_kv_cache_layout,
-                                              set_kv_cache_layout)
+try:
+    from vllm.v1.attention.backends.utils import (get_kv_cache_layout,
+                                                  set_kv_cache_layout)
+except ImportError:
+    def get_kv_cache_layout():
+        return DEFAULT_KV_CACHE_LAYOUT
+    def set_kv_cache_layout(layout):
+        pass
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec, MambaSpec,
                                         MLAAttentionSpec, SlidingWindowSpec)
@@ -61,6 +68,10 @@ logger = init_logger(__name__)
 # default layout (order) used by kv cache manager
 # N=num_blocks, H=num_heads and D=head_size
 DEFAULT_KV_CACHE_LAYOUT = "NHD"
+
+
+def _get_tensor_layers(tensor: Any) -> list[str]:
+    return getattr(tensor, 'layers', getattr(tensor, 'shared_by', []))
 
 
 def is_cache_for_ds_v4(attn_module: AttentionLayerBase) -> bool:
@@ -102,20 +113,19 @@ class KVCacheManager:
         # `[0, max_num_reqs]`) so it stays in-bounds for the smaller arrays.
         self._mamba_num_blocks: int | None = None
         self.actual_mamba_num_blocks: int | None = None
+        self._swa_num_blocks: int | None = None
+        self._full_num_blocks: int | None = None
 
     def _create_attention_spec(
             self,
             block_size: int,
             num_kv_heads: int,
             head_size: int,
-            sliding_window: bool | None = None) -> KVCacheSpec:
+            sliding_window: int | None = None,
+            extra_retained_tokens: int = 0,
+            single_projection: bool = False) -> KVCacheSpec:
         if self.use_mla:
-            page_size_bytes = get_attention_page_size_bytes(
-                self.runner.mesh, block_size, num_kv_heads, head_size,
-                self.runner.kv_cache_dtype, True)
-            page_size_padded = (self._hybrid_uniform_page_size_bytes
-                                if self._hybrid_uniform_page_size_bytes
-                                is not None else int(page_size_bytes))
+            page_size_padded = self._hybrid_uniform_page_size_bytes
             return MLAAttentionSpec(block_size=block_size,
                                     num_kv_heads=1,
                                     head_size=head_size,
@@ -124,25 +134,24 @@ class KVCacheManager:
                                     cache_config.cache_dtype,
                                     page_size_padded=page_size_padded)
         else:
-            page_size_bytes = get_attention_page_size_bytes(
-                self.runner.mesh, block_size, num_kv_heads, head_size,
-                self.runner.kv_cache_dtype, False)
-            page_size_padded = (self._hybrid_uniform_page_size_bytes
-                                if self._hybrid_uniform_page_size_bytes
-                                is not None else int(page_size_bytes))
-            if sliding_window is not None:
-                return SlidingWindowSpec(block_size=block_size,
-                                         num_kv_heads=num_kv_heads,
-                                         head_size=head_size,
-                                         dtype=self.runner.kv_cache_dtype,
-                                         sliding_window=sliding_window,
-                                         page_size_padded=page_size_padded)
+            page_size_padded = self._hybrid_uniform_page_size_bytes
+            if sliding_window is not None and sliding_window > 0:
+                spec = SlidingWindowSpec(
+                    block_size=block_size,
+                    num_kv_heads=num_kv_heads,
+                    head_size=head_size,
+                    dtype=self.runner.kv_cache_dtype,
+                    sliding_window=int(sliding_window),
+                    extra_retained_tokens=extra_retained_tokens,
+                    page_size_padded=page_size_padded)
             else:
-                return FullAttentionSpec(block_size=block_size,
+                spec = FullAttentionSpec(block_size=block_size,
                                          num_kv_heads=num_kv_heads,
                                          head_size=head_size,
                                          dtype=self.runner.kv_cache_dtype,
                                          page_size_padded=page_size_padded)
+            object.__setattr__(spec, "single_projection", single_projection)
+            return spec
 
     def update_mamba_page_size_padded(
             self, layers: dict[str, AttentionLayerBase]) -> None:
@@ -191,20 +200,18 @@ class KVCacheManager:
         if not attn_modules:
             return
 
-        first_attn_module = attn_modules[0]
+        attn_page_size_bytes = 0
         for module in attn_modules:
-            assert module.num_kv_heads == first_attn_module.num_kv_heads
-            assert module.head_size == first_attn_module.head_size
-
-        num_kv_heads = common_utils.get_padded_num_heads(
-            first_attn_module.num_kv_heads,
-            common_utils.get_mesh_shape_product(self.runner.mesh,
-                                                ShardingAxisName.ATTN_HEAD))
-        head_size = common_utils.get_padded_head_dim(
-            first_attn_module.head_size)
-        attn_page_size_bytes = get_attention_page_size_bytes(
-            self.runner.mesh, self.runner.cache_config.block_size,
-            num_kv_heads, head_size, self.runner.kv_cache_dtype, False)
+            m_num_kv_heads = common_utils.get_padded_num_heads(
+                module.num_kv_heads,
+                common_utils.get_mesh_shape_product(self.runner.mesh,
+                                                    ShardingAxisName.ATTN_HEAD))
+            m_head_size = common_utils.get_padded_head_dim(
+                module.head_size)
+            m_page_size = get_attention_page_size_bytes(
+                self.runner.mesh, self.runner.cache_config.block_size,
+                m_num_kv_heads, m_head_size, self.runner.kv_cache_dtype, False)
+            attn_page_size_bytes = max(attn_page_size_bytes, m_page_size)
 
         mamba_modules = [
             module for module in layers.values()
@@ -290,6 +297,113 @@ class KVCacheManager:
         self._maybe_set_compact_mamba_num_blocks_override(
             attn_page_size_bytes, int(unpadded_mamba_page_size),
             num_attn_groups, num_mamba_groups, num_attn, num_mamba, group_size)
+
+    def _maybe_set_compact_swa_num_blocks_override(
+            self, kv_cache_spec: dict[str, KVCacheSpec]) -> None:
+        """Asymmetrically size SWA vs Full-Attention layers:
+        - SWA layers only need max_num_reqs * (sliding_window // block_size + 1) + 1 blocks.
+        - Full-Attention layers receive the remaining HBM.
+        - cache_config.num_gpu_blocks_override is set to the full multi-group pool capacity
+          so vLLM's CPU scheduler can admit concurrent requests without false starvation.
+        """
+        cache_config = self.runner.cache_config
+        if cache_config.num_gpu_blocks_override is not None:
+            return
+
+        swa_specs = []
+        full_specs = []
+        max_sliding_window = 0
+        for spec in kv_cache_spec.values():
+            if isinstance(spec, MambaSpec):
+                continue
+            sliding_window = getattr(spec, "sliding_window", None)
+            if isinstance(sliding_window, (int, float)) and sliding_window > 0:
+                swa_specs.append(spec)
+                max_sliding_window = max(max_sliding_window, sliding_window)
+            else:
+                full_specs.append(spec)
+
+        if not swa_specs:
+            return
+
+        devices = self.runner.mesh.devices.flatten()
+        try:
+            hbm_usage = utils.hbm_usage_bytes(devices)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Compact-SWA sizing skipped: hbm_usage_bytes failed (%s).", exc)
+            return
+
+        total_limit = sum(limit for _, limit in hbm_usage)
+        total_used = sum(used for used, _ in hbm_usage)
+        gpu_mem_util = cache_config.gpu_memory_utilization
+        avail = int(total_limit * gpu_mem_util - total_used)
+        if avail <= 0:
+            return
+
+        divisor = max(common_utils.get_mesh_shape_product(
+            self.runner.mesh, ShardingAxisName.ATTN_DATA), 1)
+
+        block_size = cache_config.block_size
+        max_num_reqs = getattr(self.runner, "max_num_reqs", 32)
+        max_num_batched = getattr(getattr(self.runner, "scheduler_config", None), "max_num_batched_tokens", 512)
+        extra_tokens = 0
+        if getattr(self.runner, "speculative_config", None):
+            extra_tokens = max(getattr(self.runner.speculative_config, "num_spec_prefill_tokens", 0) - 1, 0)
+        max_model_len = getattr(self.runner, "max_model_len", None)
+
+        blocks_per_req = common_utils.get_swa_blocks_per_req(
+            int(max_sliding_window), block_size, max_num_batched, extra_tokens,
+            max_model_len=max_model_len)
+        swa_num_blocks = max_num_reqs * blocks_per_req + 1
+        swa_num_blocks = ((swa_num_blocks + divisor - 1) // divisor) * divisor
+
+        swa_total_layer_block_bytes = sum(
+            get_attention_page_size_bytes(
+                self.runner.mesh, spec.block_size,
+                spec.num_kv_heads, spec.head_size, spec.dtype,
+                self.use_mla,
+                single_projection=getattr(spec, "single_projection", False))
+            for spec in swa_specs
+        )
+
+        swa_total_mem = swa_num_blocks * swa_total_layer_block_bytes
+
+        if full_specs:
+            full_total_layer_block_bytes = sum(
+                get_attention_page_size_bytes(
+                    self.runner.mesh, spec.block_size,
+                    spec.num_kv_heads, spec.head_size, spec.dtype,
+                    self.use_mla,
+                    single_projection=getattr(spec, "single_projection", False))
+                for spec in full_specs
+            )
+            avail_full = avail - swa_total_mem
+            if avail_full > 0 and full_total_layer_block_bytes > 0:
+                full_num_blocks = int(avail_full / full_total_layer_block_bytes)
+                full_num_blocks = (full_num_blocks // divisor) * divisor
+            else:
+                full_num_blocks = swa_num_blocks
+
+            num_full_layers = len(full_specs)
+            num_swa_layers = len(swa_specs)
+            layers_per_group = math.gcd(num_full_layers, num_swa_layers) if num_full_layers > 0 else 1
+            total_pool_blocks = full_num_blocks
+            self._swa_num_blocks = swa_num_blocks
+            self._full_num_blocks = full_num_blocks
+            cache_config.num_gpu_blocks_override = full_num_blocks
+
+            logger.info(
+                "Asymmetric SWA KV cache sizing: %d full layers (N_full=%d), "
+                "%d SWA layers (N_swa=%d). Setting num_gpu_blocks_override=%d "
+                "(safe maximum physical capacity).",
+                num_full_layers, full_num_blocks, num_swa_layers, swa_num_blocks, total_pool_blocks)
+        else:
+            swa_num_blocks = int(avail / swa_total_layer_block_bytes)
+            swa_num_blocks = (swa_num_blocks // divisor) * divisor
+            self._swa_num_blocks = swa_num_blocks
+            self._full_num_blocks = None
+            cache_config.num_gpu_blocks_override = swa_num_blocks
+            logger.info("Uniform SWA KV cache: setting num_gpu_blocks_override=%d.", swa_num_blocks)
 
     def _maybe_set_compact_mamba_num_blocks_override(
             self, attn_page_size_bytes: int,
@@ -495,6 +609,13 @@ class KVCacheManager:
             # the common case.
             kv_share_map = compute_kv_share_map(text_config)
 
+            extra_retained_tokens = 0
+            if self.runner.speculative_config:
+                num_spec_prefill_tokens = getattr(
+                    self.runner.speculative_config, "num_spec_prefill_tokens", 0)
+                if isinstance(num_spec_prefill_tokens, int):
+                    extra_retained_tokens = max(num_spec_prefill_tokens - 1, 0)
+
             for i in range(model_config.get_num_layers(parallel_config)):
                 # If this layer is KV-shared, register the redirect and skip
                 # spec creation (so no slot is allocated). The forward-time
@@ -532,13 +653,16 @@ class KVCacheManager:
                     num_kv_heads = common_utils.get_padded_num_heads(
                         num_kv_heads, model_cnt)
                     head_size = common_utils.get_padded_head_dim(head_size)
-                    # TODO(kwang3939): Re-enable sliding_window once mixed dims with sliding_window is supported.
-                    sliding_window = None
+                    sliding_window = common_utils.get_layer_sliding_window(
+                        text_config, i, layer_type)
+                    single_projection = (layer_type != "sliding_attention" and getattr(text_config, "attention_k_eq_v", False))
                     kv_cache_spec[f"layer.{i}"] = self._create_attention_spec(
                         block_size,
                         num_kv_heads,
                         head_size,
-                        sliding_window=sliding_window)
+                        sliding_window=sliding_window,
+                        extra_retained_tokens=extra_retained_tokens,
+                        single_projection=single_projection)
 
             speculative_config = self.runner.speculative_config
             if speculative_config:
@@ -597,20 +721,12 @@ class KVCacheManager:
                 # be unified.
                 self.update_mamba_page_size_padded(layers)
 
-            # TODO(yuyanpeng): enable sliding windows once mixed dims support
-            # Currently, with sliding windows, there is
-            # shared_kv_cache_layers among each group.
-            # The shared kv_cache_layers do not support mixed dims for
-            # TPU for now. If share kv_cache, the attention kernel would
-            # throw exception for non-matched dimension between kv_cache
-            # and actual dims. Disable sliding window for workaround.
-            head_size_set = {
-                common_utils.get_padded_head_dim(
-                    getattr(attn_module, "head_size", 0))
-                for attn_module in layers.values()
-                if not isinstance(attn_module, MambaBase)
-            }
-            disable_sliding_window = len(head_size_set) > 1
+            extra_retained_tokens = 0
+            if self.runner.speculative_config:
+                num_spec_prefill_tokens = getattr(
+                    self.runner.speculative_config, "num_spec_prefill_tokens", 0)
+                if isinstance(num_spec_prefill_tokens, int):
+                    extra_retained_tokens = max(num_spec_prefill_tokens - 1, 0)
 
             logger.warning(f"Compilation num_layers = {len(layers)}")
 
@@ -628,9 +744,6 @@ class KVCacheManager:
                     if spec is not None:
                         kv_cache_spec[layer_name] = spec
                     continue
-
-                if disable_sliding_window:
-                    attn_module.sliding_window = None
 
                 if (kv_tgt_layer :=
                         attn_module.kv_sharing_target_layer_name) is not None:
@@ -650,13 +763,17 @@ class KVCacheManager:
                     head_size = common_utils.get_padded_head_dim(
                         attn_module.head_size)
 
-                    if attn_module.sliding_window is not None:
+                    hf_text_cfg = getattr(self.runner.model_config, "hf_text_config", None)
+                    single_proj = ((attn_module.sliding_window is None or attn_module.sliding_window <= 0) and getattr(hf_text_cfg, "attention_k_eq_v", False))
+                    if attn_module.sliding_window is not None and attn_module.sliding_window > 0:
                         kv_cache_spec[
                             layer_name] = self._create_attention_spec(
                                 block_size,
                                 num_kv_heads,
                                 head_size,
-                                sliding_window=attn_module.sliding_window)
+                                sliding_window=attn_module.sliding_window,
+                                extra_retained_tokens=extra_retained_tokens,
+                                single_projection=False)
                     elif self.use_mla:
                         kv_cache_spec[
                             layer_name] = self._create_attention_spec(
@@ -664,17 +781,17 @@ class KVCacheManager:
                     else:
                         kv_cache_spec[
                             layer_name] = self._create_attention_spec(
-                                block_size, num_kv_heads, head_size)
+                                block_size, num_kv_heads, head_size,
+                                single_projection=single_proj)
                 elif attn_module.attn_type in (AttentionType.ENCODER,
                                                AttentionType.ENCODER_ONLY):
                     # encoder-only attention does not need KV cache.
                     continue
-                elif attn_module.attn_type == AttentionType.ENCODER_DECODER:
-                    raise NotImplementedError
                 else:
                     raise ValueError(
                         f"Unknown attention type: {attn_module.attn_type}")
 
+        self._maybe_set_compact_swa_num_blocks_override(kv_cache_spec)
         return kv_cache_spec
 
     def get_kv_cache_layout(self):
@@ -772,9 +889,10 @@ class KVCacheManager:
         duplicate_shared_layers = False
         if not duplicate_shared_layers:
             for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+                tensor_layers = _get_tensor_layers(kv_cache_tensor)
                 if any(
                         isinstance(layer_name_to_spec[layer_name], MambaSpec)
-                        for layer_name in kv_cache_tensor.shared_by):
+                        for layer_name in tensor_layers):
                     # TODO (jacobplatin): we should not be replicating the kv cache for each layer and instead
                     # should follow the native GPU/Torch approach where every group of layers (shared_by)
                     # shares the same underlying raw tensor.
@@ -782,24 +900,20 @@ class KVCacheManager:
                         "MambaSpec does not support shared layers for now, defaulting to single KV cache per layer..."
                     )
                     duplicate_shared_layers = True
-                    non_mtp_tensors = [
-                        t for t in kv_cache_config.kv_cache_tensors
-                        if not any("mtp" in name for name in t.shared_by)
-                    ]
-                    if non_mtp_tensors:
-                        # assert that each kv_cache_tensor in kv_cache_config.kv_cache_tensors has the same number of shared layers
-                        # This is needed for models like Qwen3.5 where every 4 layers share the same KV cache (3 linear attn and 1 full attn)
-                        num_shared_layers = len(non_mtp_tensors[0].shared_by)
-                        for kv_cache_tensor in non_mtp_tensors:
-                            assert len(
-                                kv_cache_tensor.shared_by
-                            ) == num_shared_layers, f"Expected all non-MTP kv_cache_tensors to have the same number of shared layers {num_shared_layers}, but found {len(kv_cache_tensor.shared_by)}"
                     break
+                if len(tensor_layers) > 1:
+                    is_draft = any("draft" in name or "mtp" in name for name in tensor_layers)
+                    if not is_draft:
+                        duplicate_shared_layers = True
+                        break
 
         for i, kv_cache_tensor in enumerate(kv_cache_config.kv_cache_tensors):
-            if duplicate_shared_layers:
+            tensor_layers = _get_tensor_layers(kv_cache_tensor)
+            if self.runner.cache_config.num_gpu_blocks_override is not None:
+                num_blocks = self.runner.cache_config.num_gpu_blocks_override
+            elif duplicate_shared_layers:
                 total_group_page_size = 0
-                for name in kv_cache_tensor.shared_by:
+                for name in tensor_layers:
                     spec = layer_name_to_spec[name]
                     # Use the per-layer *TPU-actual* per-block bytes so the
                     # sum equals the `page_size_padded` that
@@ -817,7 +931,8 @@ class KVCacheManager:
                         total_group_page_size += get_attention_page_size_bytes(
                             self.runner.mesh, spec.block_size,
                             spec.num_kv_heads, spec.head_size, spec.dtype,
-                            self.use_mla)
+                            self.use_mla,
+                            single_projection=getattr(spec, "single_projection", False))
                 num_blocks = kv_cache_tensor.size // total_group_page_size
             elif kv_cache_tensor.block_stride:
                 # DeepseekV4 packed layout: vLLM overlays every cache
@@ -835,7 +950,7 @@ class KVCacheManager:
                 # If sharing KV cache, compute `num_blocks` using the page size
                 # of the first layer.
                 page_size_bytes = layer_name_to_spec[
-                    kv_cache_tensor.shared_by[0]].page_size_bytes
+                    tensor_layers[0]].page_size_bytes
                 assert kv_cache_tensor.size % page_size_bytes == 0
                 num_blocks = kv_cache_tensor.size // page_size_bytes
 
@@ -845,11 +960,6 @@ class KVCacheManager:
 
             # num_blocks must be a multiple of the sharding divisor
             num_blocks = (num_blocks // divisor) * divisor
-
-            if self.runner.cache_config.num_gpu_blocks_override is not None:
-                num_blocks = min(
-                    num_blocks,
-                    self.runner.cache_config.num_gpu_blocks_override)
 
             # When compact-mamba sizing succeeded (set by
             # `_maybe_set_compact_mamba_num_blocks_override`), mamba layers
@@ -863,7 +973,7 @@ class KVCacheManager:
             if self.actual_mamba_num_blocks is None:
                 self.actual_mamba_num_blocks = mamba_num_blocks
 
-            for j, layer_name in enumerate(kv_cache_tensor.shared_by):
+            for j, layer_name in enumerate(tensor_layers):
                 layer_spec = layer_name_to_spec[layer_name]
                 if isinstance(layer_spec, MambaSpec):
                     mamba_states = []
@@ -910,10 +1020,18 @@ class KVCacheManager:
                     # is True, we should init a new kv cache for each layer in shared_by
                     if j == 0 or duplicate_shared_layers:
                         # NOTE: we'll multiply the num_kv_heads by 2 in the function
-                        block_size = layer_spec.storage_block_size
+                        block_size = getattr(layer_spec, "storage_block_size", layer_spec.block_size)
+                        layer_num_blocks = num_blocks
+                        sliding_window = getattr(layer_spec, "sliding_window", None)
+                        if isinstance(sliding_window, (int, float)) and sliding_window > 0:
+                            if self._swa_num_blocks is not None:
+                                layer_num_blocks = self._swa_num_blocks
+                        else:
+                            if self._full_num_blocks is not None:
+                                layer_num_blocks = self._full_num_blocks
 
                         kv_cache = create_kv_caches(
-                            num_blocks=num_blocks,
+                            num_blocks=layer_num_blocks,
                             block_size=block_size,
                             num_kv_heads=layer_spec.num_kv_heads,
                             head_size=layer_spec.head_size,
@@ -921,6 +1039,7 @@ class KVCacheManager:
                             layer_names=[f'kv_cache_tensor.{i}'],
                             cache_dtype=t2j_dtype(layer_spec.dtype),
                             use_mla=self.use_mla,
+                            single_projection=getattr(layer_spec, "single_projection", False),
                         )[0]
                         kv_caches.append(kv_cache)
 
@@ -935,10 +1054,13 @@ class KVCacheManager:
                 # if duplicate_shared_layers is False.  Otherwise, if duplicate_shared_layers
                 # is True, we should add the blocks for each layer in shared_by.
                 if j == 0 or duplicate_shared_layers:
-                    num_blocks_list.append(mamba_num_blocks if isinstance(
-                        layer_spec, MambaSpec) else num_blocks)
-                layer_idx = (i * num_shared_layers
-                             ) + j if duplicate_shared_layers else i
+                    if isinstance(layer_spec, MambaSpec):
+                        num_blocks_list.append(mamba_num_blocks)
+                    elif isinstance(getattr(layer_spec, "sliding_window", None), (int, float)) and getattr(layer_spec, "sliding_window", None) > 0:
+                        num_blocks_list.append(self._swa_num_blocks if self._swa_num_blocks is not None else num_blocks)
+                    else:
+                        num_blocks_list.append(self._full_num_blocks if self._full_num_blocks is not None else num_blocks)
+                layer_idx = len(kv_caches) - 1 if duplicate_shared_layers else i
                 self.runner.layer_name_to_kvcache_index[layer_name] = layer_idx
         if self.shared_kv_cache_layers:
             for layer_name, target_layer_name in self.shared_kv_cache_layers.items(
@@ -1069,13 +1191,14 @@ class KVCacheManager:
                         f"of block_stride: size={tensor.size}, "
                         f"block_stride={tensor.block_stride}, "
                         f"offset={tensor.offset}, "
-                        f"shared_by={tensor.shared_by}")
+                        f"shared_by={_get_tensor_layers(tensor)}")
                 num_blocks_candidates.add(tensor.size // tensor.block_stride)
             else:
                 # Legacy layout without a packed slab: the tensor is sized
                 # for its own layers' page size.
+                t_layers = _get_tensor_layers(tensor)
                 page_size = layer_name_to_spec[
-                    tensor.shared_by[0]].page_size_bytes
+                    t_layers[0]].page_size_bytes
                 num_blocks_candidates.add(tensor.size // page_size)
         if len(num_blocks_candidates) != 1:
             raise ValueError(
@@ -1414,8 +1537,8 @@ class KVCacheManager:
                                                             chunk_size *
                                                             block_size,
                                                             axis=0)
-            reshaped_slices = extracted_slices.reshape(-1, block_size,
-                                                       *slices.shape[1:])
+            reshaped_slices = extracted_slices.reshape(chunk_size,
+                                                       *cache.shape[1:])
 
             return jax.lax.dynamic_update_slice_in_dim(cache,
                                                        reshaped_slices,
@@ -1426,28 +1549,75 @@ class KVCacheManager:
 
     def get_kv_cache_for_block_ids(
         self,
-        block_ids: List[int],
+        block_ids: List[int] | List[List[int]],
     ) -> List[jax.Array]:
         """
         Extracts the KV cache slices for a given list of block IDs.
         This assumes all provided blocks are full.
 
         Args:
-            block_ids: A list of block IDs to extract KV cache for.
+            block_ids: A list of block IDs (1D for single-group, 2D for multi-group).
 
         Returns:
             A list of JAX arrays, with each array representing the KV cache
             slices for a layer, concatenated for all blocks.
         """
-        if block_ids == list(range(block_ids[0],
-                                   block_ids[0] + len(block_ids))):
-            batched_kv_cache_per_layer = self._jitted_gather_continuous_kv_cache(
-                self.runner.kv_caches, block_ids[0], len(block_ids))
+        if not block_ids or not self.runner.kv_caches:
+            return []
 
+        # Normalize 1D legacy block_ids to multi-group 2D list
+        if isinstance(block_ids[0], int):
+            num_groups = len(self.runner.kv_cache_config.kv_cache_groups) if (
+                getattr(self.runner, "kv_cache_config", None) and self.runner.kv_cache_config.kv_cache_groups
+            ) else 1
+            nested_block_ids = [block_ids for _ in range(num_groups)]  # type: ignore
         else:
-            batched_kv_cache_per_layer = self._jitted_gather_kv_cache(
-                self.runner.kv_caches, jnp.array(block_ids))
-        return batched_kv_cache_per_layer
+            nested_block_ids = block_ids  # type: ignore
+
+        if not nested_block_ids or not any(nested_block_ids):
+            return []
+
+        # If no kv_cache_groups configured, fallback to legacy behavior across all runner.kv_caches
+        if not getattr(self.runner, "kv_cache_config", None) or not self.runner.kv_cache_config.kv_cache_groups:
+            g_block_ids = nested_block_ids[0]
+            if not g_block_ids:
+                return []
+            if g_block_ids == list(range(g_block_ids[0], g_block_ids[0] + len(g_block_ids))):
+                return self._jitted_gather_continuous_kv_cache(
+                    self.runner.kv_caches, g_block_ids[0], len(g_block_ids))
+            else:
+                return self._jitted_gather_kv_cache(
+                    self.runner.kv_caches, jnp.array(g_block_ids))
+
+        extracted_slices = []
+        for gid, group in enumerate(self.runner.kv_cache_config.kv_cache_groups):
+            if gid >= len(nested_block_ids):
+                break
+            g_block_ids = nested_block_ids[gid]
+            if not g_block_ids:
+                continue
+
+            # Deduplicate physical array indices to support KV-shared layers (E2B / E4B)
+            group_layer_indices = list(dict.fromkeys(
+                self.runner.layer_name_to_kvcache_index[name] for name in group.layer_names
+                if name in self.runner.layer_name_to_kvcache_index
+            ))
+            if not group_layer_indices:
+                continue
+            group_kv_caches = [self.runner.kv_caches[idx] for idx in group_layer_indices]
+
+            # Fast continuous slice vs scattered gather
+            if g_block_ids == list(range(g_block_ids[0], g_block_ids[0] + len(g_block_ids))):
+                group_slices = self._jitted_gather_continuous_kv_cache(
+                    group_kv_caches, g_block_ids[0], len(g_block_ids)
+                )
+            else:
+                group_slices = self._jitted_gather_kv_cache(
+                    group_kv_caches, jnp.array(g_block_ids)
+                )
+            extracted_slices.extend(group_slices)
+
+        return extracted_slices
 
     def transfer_kv_cache(self,
                           kv_cache_slices: List[jax.Array]) -> List[jax.Array]:
@@ -1498,7 +1668,7 @@ class KVCacheManager:
         self,
         request: "Request",
         kv_cache_slices: List[jax.Array],
-        block_ids: List[List[int]],
+        block_ids: List[int] | List[List[int]],
     ):
         """
         Inserts a request and its KV cache into the runner. This is used to
@@ -1513,43 +1683,100 @@ class KVCacheManager:
             kv_cache_slices: The KV cache for the request, already transferred
                 to this runner's mesh. This is a list of JAX arrays, one per layer.
             block_ids: The physical block numbers allocated for this request on
-                this runner. This is a list of lists, for each KV cache group.
+                this runner (either 1D List[int] or 2D List[List[int]]).
         """
-        # Assume one KV cache group for now, which is consistent with current setup.
-        if len(block_ids) > 1:
-            raise NotImplementedError(
-                "Inserting KV cache for models with multiple KV cache groups "
-                "is not supported yet.")
-        block_numbers = block_ids[0]
-        if block_numbers == list(
-                range(block_numbers[0],
-                      block_numbers[0] + len(block_numbers))):
-            # For continuous blocks we use slice instead of scatter.
-            start_block = block_numbers[0]
-            with runner_utils.LatencyTracker(
-                    f"JittedInsertContinuousKVCache-b{len(block_numbers)}"):
-                logger.debug(f"inserting to continuous blocks {block_numbers}")
-                self.runner.kv_caches = KVCacheManager._jitted_insert_continuous_kv_cache_from_slice(
-                    self.runner.block_size,
-                    len(block_numbers),
-                    self.runner.kv_caches,
-                    kv_cache_slices,
-                    0,
-                    start_block,
-                )
-                jax.block_until_ready(self.runner.kv_caches)
+        if not block_ids or not kv_cache_slices:
+            return
+
+        if isinstance(block_ids[0], int):
+            num_groups = len(self.runner.kv_cache_config.kv_cache_groups) if (
+                getattr(self.runner, "kv_cache_config", None) and self.runner.kv_cache_config.kv_cache_groups
+            ) else 1
+            nested_block_ids = [block_ids for _ in range(num_groups)]  # type: ignore
         else:
-            with runner_utils.LatencyTracker(
-                    f"JittedInsertKVCache-b{len(block_numbers)}"):
-                logger.debug(
-                    f"inserting to non continuous blocks {block_numbers}")
-                self.runner.kv_caches = KVCacheManager._jitted_insert_kv_cache(
-                    self.runner.block_size,
-                    self.runner.kv_caches,
-                    kv_cache_slices,
-                    block_numbers,
-                )
-                jax.block_until_ready(self.runner.kv_caches)
+            nested_block_ids = block_ids  # type: ignore
+
+        if not nested_block_ids or not any(nested_block_ids):
+            return
+
+        if not getattr(self.runner, "kv_cache_config", None) or not self.runner.kv_cache_config.kv_cache_groups:
+            block_numbers = nested_block_ids[0]
+            if not block_numbers:
+                return
+            if block_numbers == list(range(block_numbers[0], block_numbers[0] + len(block_numbers))):
+                start_block = block_numbers[0]
+                with runner_utils.LatencyTracker(f"JittedInsertContinuousKVCache-b{len(block_numbers)}"):
+                    self.runner.kv_caches = KVCacheManager._jitted_insert_continuous_kv_cache_from_slice(
+                        self.runner.block_size,
+                        len(block_numbers),
+                        self.runner.kv_caches,
+                        kv_cache_slices,
+                        0,
+                        start_block,
+                    )
+                    jax.block_until_ready(self.runner.kv_caches)
+            else:
+                with runner_utils.LatencyTracker(f"JittedInsertKVCache-b{len(block_numbers)}"):
+                    self.runner.kv_caches = KVCacheManager._jitted_insert_kv_cache(
+                        self.runner.block_size,
+                        self.runner.kv_caches,
+                        kv_cache_slices,
+                        block_numbers,
+                    )
+                    jax.block_until_ready(self.runner.kv_caches)
+        else:
+            slice_offset = 0
+            for gid, group in enumerate(self.runner.kv_cache_config.kv_cache_groups):
+                if gid >= len(nested_block_ids):
+                    break
+                g_block_ids = nested_block_ids[gid]
+                group_block_size = getattr(group.kv_cache_spec, "block_size", self.runner.block_size)
+                group_layer_indices = list(dict.fromkeys(
+                    self.runner.layer_name_to_kvcache_index[name] for name in group.layer_names
+                    if name in self.runner.layer_name_to_kvcache_index
+                ))
+                num_group_layers = len(group_layer_indices) if group_layer_indices else len(group.layer_names)
+                group_slices = kv_cache_slices[slice_offset:slice_offset + num_group_layers]
+                slice_offset += num_group_layers
+
+                if not g_block_ids or not group_layer_indices:
+                    continue
+                group_kv_caches = [self.runner.kv_caches[idx] for idx in group_layer_indices]
+                if not group_slices or len(group_slices) != len(group_kv_caches):
+                    continue
+
+                if g_block_ids == list(
+                        range(g_block_ids[0],
+                              g_block_ids[0] + len(g_block_ids))):
+                    start_block = g_block_ids[0]
+                    with runner_utils.LatencyTracker(
+                            f"JittedInsertContinuousKVCache-g{gid}-b{len(g_block_ids)}"):
+                        logger.debug(
+                            f"inserting group {gid} to continuous blocks {g_block_ids}")
+                        updated_group_caches = KVCacheManager._jitted_insert_continuous_kv_cache_from_slice(
+                            group_block_size,
+                            len(g_block_ids),
+                            group_kv_caches,
+                            group_slices,
+                            0,
+                            start_block,
+                        )
+                else:
+                    with runner_utils.LatencyTracker(
+                            f"JittedInsertKVCache-g{gid}-b{len(g_block_ids)}"):
+                        logger.debug(
+                            f"inserting group {gid} to non-continuous blocks {g_block_ids}")
+                        updated_group_caches = KVCacheManager._jitted_insert_kv_cache(
+                            group_block_size,
+                            group_kv_caches,
+                            group_slices,
+                            g_block_ids,
+                        )
+
+                for idx, updated_cache in zip(group_layer_indices, updated_group_caches):
+                    self.runner.kv_caches[idx] = updated_cache
+
+            jax.block_until_ready(self.runner.kv_caches)
 
         logger.debug(
             f"Updated kv cache entries cnt={len(self.runner.kv_caches)}")
@@ -1566,7 +1793,7 @@ class KVCacheManager:
             prompt_token_ids=request.prompt_token_ids,
             output_token_ids=[request.all_token_ids[-1]],
             sampling_params=request.sampling_params,
-            block_ids=tuple(block_ids),
+            block_ids=tuple(nested_block_ids),
             num_computed_tokens=request.num_computed_tokens,
             lora_request=request.lora_request,
             mm_features=getattr(request, "mm_features", []),
