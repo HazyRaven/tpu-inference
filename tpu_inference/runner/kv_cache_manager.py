@@ -39,6 +39,7 @@ except ImportError:
         return DEFAULT_KV_CACHE_LAYOUT
     def set_kv_cache_layout(layout):
         pass
+from vllm.v1.core.kv_cache_utils import unify_kv_cache_spec_page_size
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec, MambaSpec,
                                         MLAAttentionSpec, SlidingWindowSpec)
@@ -130,10 +131,10 @@ class KVCacheManager:
         # Model config fallback (polymorphic text_config lookup)
         model_config = getattr(self.runner, "model_config", None)
         if model_config is not None:
-            text_config = getattr(
-                model_config, "hf_text_config",
-                getattr(getattr(model_config, "hf_config", None), "text_config",
-                        getattr(model_config, "hf_config", None)))
+            hf_config = getattr(model_config, "hf_config", None)
+            text_config = getattr(hf_config, "text_config", hf_config) if hf_config is not None else None
+            if text_config is None or not getattr(text_config, "attention_k_eq_v", False):
+                text_config = getattr(model_config, "hf_text_config", text_config)
             if text_config is not None and getattr(text_config, "attention_k_eq_v", False):
                 return True
         return False
@@ -148,7 +149,7 @@ class KVCacheManager:
             single_projection: bool = False) -> KVCacheSpec:
         if self.use_mla:
             page_size_padded = self._hybrid_uniform_page_size_bytes
-            return MLAAttentionSpec(block_size=block_size,
+            spec = MLAAttentionSpec(block_size=block_size,
                                     num_kv_heads=1,
                                     head_size=head_size,
                                     dtype=self.runner.kv_cache_dtype,
@@ -173,7 +174,7 @@ class KVCacheManager:
                                          dtype=self.runner.kv_cache_dtype,
                                          page_size_padded=page_size_padded)
             object.__setattr__(spec, "single_projection", single_projection)
-            return spec
+        return spec
 
     def update_mamba_page_size_padded(
             self, layers: dict[str, AttentionLayerBase]) -> None:
@@ -332,18 +333,20 @@ class KVCacheManager:
         if cache_config.num_gpu_blocks_override is not None:
             return
 
+        effective_specs = unify_kv_cache_spec_page_size(dict(kv_cache_spec))
+
         swa_specs = []
         full_specs = []
         max_sliding_window = 0
-        for spec in kv_cache_spec.values():
+        for name, spec in effective_specs.items():
             if isinstance(spec, MambaSpec):
                 continue
             sliding_window = getattr(spec, "sliding_window", None)
             if isinstance(sliding_window, (int, float)) and sliding_window > 0:
-                swa_specs.append(spec)
+                swa_specs.append((name, spec))
                 max_sliding_window = max(max_sliding_window, sliding_window)
             else:
-                full_specs.append(spec)
+                full_specs.append((name, spec))
 
         if not swa_specs:
             return
@@ -369,25 +372,25 @@ class KVCacheManager:
         max_num_reqs = getattr(self.runner, "max_num_reqs", 32)
         max_num_batched = getattr(getattr(self.runner, "scheduler_config", None), "max_num_batched_tokens", 512)
         extra_tokens = 0
-        if getattr(self.runner, "speculative_config", None):
-            extra_tokens = max(getattr(self.runner.speculative_config, "num_spec_prefill_tokens", 0) - 1, 0)
+        spec_cfg = getattr(self.runner.vllm_config, "speculative_config", None) or getattr(self.runner, "speculative_config", None)
+        if spec_cfg is not None:
+            extra_tokens = max(getattr(spec_cfg, "num_spec_prefill_tokens", 0) - 1, 0)
         max_model_len = getattr(self.runner, "max_model_len", None)
 
         blocks_per_req = common_utils.get_swa_blocks_per_req(
             int(max_sliding_window), block_size, max_num_batched, extra_tokens,
             max_model_len=max_model_len)
-        swa_num_blocks = max_num_reqs * blocks_per_req + 1
-        swa_num_blocks = ((swa_num_blocks + divisor - 1) // divisor) * divisor
+        raw_swa_num_blocks = max_num_reqs * blocks_per_req + 1
+        swa_num_blocks = ((raw_swa_num_blocks + divisor - 1) // divisor) * divisor
 
         swa_total_layer_block_bytes = sum(
             get_attention_page_size_bytes(
                 self.runner.mesh, spec.block_size,
                 spec.num_kv_heads, spec.head_size, spec.dtype,
                 self.use_mla,
-                single_projection=self._is_single_projection(spec))
-            for spec in swa_specs
+                single_projection=self._is_single_projection(spec, name))
+            for name, spec in swa_specs
         )
-
         swa_total_mem = swa_num_blocks * swa_total_layer_block_bytes
 
         if full_specs:
@@ -396,29 +399,23 @@ class KVCacheManager:
                     self.runner.mesh, spec.block_size,
                     spec.num_kv_heads, spec.head_size, spec.dtype,
                     self.use_mla,
-                    single_projection=self._is_single_projection(spec))
-                for spec in full_specs
+                    single_projection=self._is_single_projection(spec, name))
+                for name, spec in full_specs
             )
             avail_full = avail - swa_total_mem
             if avail_full > 0 and full_total_layer_block_bytes > 0:
-                full_num_blocks = int(avail_full / full_total_layer_block_bytes)
-                full_num_blocks = (full_num_blocks // divisor) * divisor
+                raw_full_num_blocks = int(avail_full / full_total_layer_block_bytes)
+                full_num_blocks = (raw_full_num_blocks // divisor) * divisor
             else:
                 full_num_blocks = swa_num_blocks
 
-            num_full_layers = len(full_specs)
-            num_swa_layers = len(swa_specs)
-            layers_per_group = math.gcd(num_full_layers, num_swa_layers) if num_full_layers > 0 else 1
-            total_pool_blocks = full_num_blocks
             self._swa_num_blocks = swa_num_blocks
             self._full_num_blocks = full_num_blocks
             cache_config.num_gpu_blocks_override = full_num_blocks
-
             logger.info(
-                "Asymmetric SWA KV cache sizing: %d full layers (N_full=%d), "
-                "%d SWA layers (N_swa=%d). Setting num_gpu_blocks_override=%d "
-                "(safe maximum physical capacity).",
-                num_full_layers, full_num_blocks, num_swa_layers, swa_num_blocks, total_pool_blocks)
+                "Asymmetric SWA KV cache: setting num_gpu_blocks_override=%d "
+                "(SWA blocks: %d, Full blocks: %d).",
+                full_num_blocks, swa_num_blocks, full_num_blocks)
         else:
             swa_num_blocks = int(avail / swa_total_layer_block_bytes)
             swa_num_blocks = (swa_num_blocks // divisor) * divisor

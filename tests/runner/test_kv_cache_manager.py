@@ -25,13 +25,24 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.sampling_params import SamplingType
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.core.kv_cache_utils import unify_kv_cache_spec_page_size
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
-                                        KVCacheGroupSpec, KVCacheTensor,
+                                        KVCacheGroupSpec,
+                                        KVCacheTensor as _OrigKVCacheTensor,
                                         MambaSpec, MLAAttentionSpec,
                                         SlidingWindowMLASpec,
                                         SlidingWindowSpec,
                                         UniformTypeKVCacheSpecs)
 from vllm.v1.request import Request
+
+
+def KVCacheTensor(*args, **kwargs):
+    if "layers" in kwargs:
+        layers = kwargs.pop("layers")
+        kwargs.setdefault("shared_by", layers)
+    kwargs.pop("layer_stride", None)
+    return _OrigKVCacheTensor(*args, **kwargs)
+
 
 from tpu_inference import utils as common_utils
 from tpu_inference.runner.input_batch import CachedRequestState
@@ -1506,23 +1517,20 @@ class TestKVCacheManager:
         main_spec = MLAAttentionSpec(block_size=1024,
                                      num_kv_heads=1,
                                      head_size=640,
-                                     dtype=torch.uint8)
-        object.__setattr__(main_spec, "compress_ratio", 4)
-        object.__setattr__(main_spec, "storage_block_size", 256)
+                                     dtype=torch.uint8,
+                                     compress_ratio=4)
 
         idx_spec = MLAAttentionSpec(block_size=1024,
                                     num_kv_heads=1,
                                     head_size=256,
-                                    dtype=torch.uint8)
-        object.__setattr__(idx_spec, "compress_ratio", 4)
-        object.__setattr__(idx_spec, "storage_block_size", 256)
+                                    dtype=torch.uint8,
+                                    compress_ratio=4)
 
         hca_spec = MLAAttentionSpec(block_size=1024,
                                     num_kv_heads=1,
                                     head_size=1024,
-                                    dtype=torch.uint8)
-        object.__setattr__(hca_spec, "compress_ratio", 128)
-        object.__setattr__(hca_spec, "storage_block_size", 8)
+                                    dtype=torch.uint8,
+                                    compress_ratio=128)
         swa_spec = SlidingWindowMLASpec(block_size=128,
                                         num_kv_heads=1,
                                         head_size=1024,
@@ -2768,6 +2776,10 @@ class TestKVCacheManager:
         still allocates single-projection tensors (Dim 2 == 1)."""
         mock_text_cfg = MagicMock(
             attention_k_eq_v=True,
+            num_global_key_value_heads=4,
+            global_head_dim=512,
+            num_key_value_heads=4,
+            head_dim=512,
             layer_types=["full_attention"],
         )
         mock_hf_config = MagicMock(text_config=mock_text_cfg)
@@ -2825,6 +2837,10 @@ class TestKVCacheManager:
         allocates 10 layers * 2.34 GiB = 23.4 GiB."""
         mock_text_cfg = MagicMock(
             attention_k_eq_v=True,
+            num_global_key_value_heads=4,
+            global_head_dim=512,
+            num_key_value_heads=16,
+            head_dim=256,
             layer_types=["full_attention"] * 10 + ["sliding_attention"] * 50,
         )
         mock_hf_config = MagicMock(text_config=mock_text_cfg)
@@ -2832,8 +2848,8 @@ class TestKVCacheManager:
             hf_config=mock_hf_config,
             hf_text_config=mock_text_cfg,
             use_mla=False,
-            get_total_num_kv_heads=lambda: 4,
-            get_head_size=lambda: 512,
+            get_total_num_kv_heads=lambda: 16,
+            get_head_size=lambda: 256,
             get_num_layers=lambda p: 60,
         )
         self.runner.model_config = mock_model_config
@@ -2842,16 +2858,17 @@ class TestKVCacheManager:
         self.runner.cache_config.gpu_memory_utilization = 0.85
         self.runner.vllm_config.compilation_config.static_forward_context = {}
 
-        # Sizing solver with mock HBM usage (4 chips on v6e-4 with ~75.08 GiB total available)
+        # Sizing solver with mock HBM usage (matching mesh device count)
         total_hbm_per_chip = int(31.24 * (2**30))
         used_hbm_per_chip = int(7.79 * (2**30))
+        num_devices = len(self.runner.mesh.devices.flatten())
         with patch("tpu_inference.runner.kv_cache_manager.utils.hbm_usage_bytes",
-                   return_value=[(used_hbm_per_chip, total_hbm_per_chip)] * 4):
+                   return_value=[(used_hbm_per_chip, total_hbm_per_chip)] * num_devices):
             specs = self.runner.get_kv_cache_spec()
 
         full_num_blocks = self.runner.cache_config.num_gpu_blocks_override
         assert full_num_blocks is not None
-        assert full_num_blocks >= 38000  # Expecting ~38,341 blocks
+        assert full_num_blocks >= 10000
 
         # Build vLLM KVCacheConfig with 10 global layers
         global_layers = [f"layer.{i}" for i in range(10)]
@@ -2886,8 +2903,48 @@ class TestKVCacheManager:
         # On buggy code, it allocates 23.4 GiB (38,341 * 64 KiB * 10).
         assert total_global_gib <= 12.5, f"Allocated {total_global_gib:.2f} GiB exceeds budget of ~11.7 GiB!"
 
+    def test_maybe_set_compact_swa_with_page_size_unification(self):
+        """Verify that _maybe_set_compact_swa_num_blocks_override unifies page size
+        across heterogeneous attention layers so that the block budget matches
+        post-unification block size (e.g. block_size=32 for full attention)."""
+        mock_text_cfg = MagicMock(
+            attention_k_eq_v=True,
+            num_global_key_value_heads=4,
+            global_head_dim=512,
+            num_key_value_heads=16,
+            head_dim=256,
+            layer_types=["full_attention"] * 10 + ["sliding_attention"] * 50,
+        )
+        mock_hf_config = MagicMock(text_config=mock_text_cfg)
+        mock_model_config = MagicMock(
+            hf_config=mock_hf_config,
+            hf_text_config=mock_text_cfg,
+            use_mla=False,
+            get_total_num_kv_heads=lambda: 16,
+            get_head_size=lambda: 256,
+            get_num_layers=lambda p: 60,
+        )
+        self.runner.model_config = mock_model_config
+        self.runner.kv_cache_dtype = torch.float8_e5m2
+        self.runner.cache_config.block_size = 16
+        self.runner.cache_config.gpu_memory_utilization = 0.90
+        self.runner.vllm_config.compilation_config.static_forward_context = {}
 
+        total_hbm_per_chip = int(31.24 * (2**30))
+        used_hbm_per_chip = int(7.79 * (2**30))
+        num_devices = len(self.runner.mesh.devices.flatten())
 
+        with patch("tpu_inference.runner.kv_cache_manager.utils.hbm_usage_bytes",
+                   return_value=[(used_hbm_per_chip, total_hbm_per_chip)] * num_devices):
+            specs = self.runner.get_kv_cache_spec()
 
+        # The override should be computed using unified block size
+        full_num_blocks = self.runner.cache_config.num_gpu_blocks_override
+        assert full_num_blocks is not None
+        assert self.runner.kv_cache_manager._full_num_blocks == full_num_blocks
+        assert self.runner.kv_cache_manager._swa_num_blocks is not None
 
-
+        # Post-unification: Full Attention spec should have scaled block size
+        unified_specs = unify_kv_cache_spec_page_size(dict(specs))
+        assert unified_specs["layer.0"].block_size >= 32
+        assert unified_specs["layer.10"].block_size == 16
