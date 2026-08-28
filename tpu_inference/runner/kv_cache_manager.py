@@ -115,6 +115,28 @@ class KVCacheManager:
         self.actual_mamba_num_blocks: int | None = None
         self._swa_num_blocks: int | None = None
         self._full_num_blocks: int | None = None
+        self._single_proj_layers: set[str] = set()
+
+    def _is_single_projection(self, layer_spec: KVCacheSpec, layer_name: str | None = None) -> bool:
+        """Determines if a layer uses single projection (K == V)."""
+        if layer_name is not None and layer_name in self._single_proj_layers:
+            return True
+        if getattr(layer_spec, "single_projection", False):
+            return True
+        sliding_window = getattr(layer_spec, "sliding_window", None)
+        if (isinstance(sliding_window, (int, float)) and sliding_window > 0) or isinstance(layer_spec, SlidingWindowSpec):
+            return False
+
+        # Model config fallback (polymorphic text_config lookup)
+        model_config = getattr(self.runner, "model_config", None)
+        if model_config is not None:
+            text_config = getattr(
+                model_config, "hf_text_config",
+                getattr(getattr(model_config, "hf_config", None), "text_config",
+                        getattr(model_config, "hf_config", None)))
+            if text_config is not None and getattr(text_config, "attention_k_eq_v", False):
+                return True
+        return False
 
     def _create_attention_spec(
             self,
@@ -362,7 +384,7 @@ class KVCacheManager:
                 self.runner.mesh, spec.block_size,
                 spec.num_kv_heads, spec.head_size, spec.dtype,
                 self.use_mla,
-                single_projection=getattr(spec, "single_projection", False))
+                single_projection=self._is_single_projection(spec))
             for spec in swa_specs
         )
 
@@ -374,7 +396,7 @@ class KVCacheManager:
                     self.runner.mesh, spec.block_size,
                     spec.num_kv_heads, spec.head_size, spec.dtype,
                     self.use_mla,
-                    single_projection=getattr(spec, "single_projection", False))
+                    single_projection=self._is_single_projection(spec))
                 for spec in full_specs
             )
             avail_full = avail - swa_total_mem
@@ -658,6 +680,8 @@ class KVCacheManager:
                     sliding_window = common_utils.get_layer_sliding_window(
                         text_config, i, layer_type)
                     single_projection = (layer_type != "sliding_attention" and getattr(text_config, "attention_k_eq_v", False))
+                    if single_projection:
+                        self._single_proj_layers.add(f"layer.{i}")
                     kv_cache_spec[f"layer.{i}"] = self._create_attention_spec(
                         block_size,
                         num_kv_heads,
@@ -770,6 +794,8 @@ class KVCacheManager:
                         getattr(getattr(self.runner.model_config, "hf_config", None), "text_config",
                                 getattr(self.runner.model_config, "hf_config", None)))
                     single_proj = ((attn_module.sliding_window is None or attn_module.sliding_window <= 0) and getattr(hf_text_cfg, "attention_k_eq_v", False))
+                    if single_proj:
+                        self._single_proj_layers.add(layer_name)
                     if attn_module.sliding_window is not None and attn_module.sliding_window > 0:
                         kv_cache_spec[
                             layer_name] = self._create_attention_spec(
@@ -937,7 +963,7 @@ class KVCacheManager:
                             self.runner.mesh, spec.block_size,
                             spec.num_kv_heads, spec.head_size, spec.dtype,
                             self.use_mla,
-                            single_projection=getattr(spec, "single_projection", False))
+                            single_projection=self._is_single_projection(spec, name))
                 num_blocks = kv_cache_tensor.size // total_group_page_size
             elif kv_cache_tensor.block_stride:
                 # DeepseekV4 packed layout: vLLM overlays every cache
@@ -1044,7 +1070,7 @@ class KVCacheManager:
                             layer_names=[f'kv_cache_tensor.{i}'],
                             cache_dtype=t2j_dtype(layer_spec.dtype),
                             use_mla=self.use_mla,
-                            single_projection=getattr(layer_spec, "single_projection", False),
+                            single_projection=self._is_single_projection(layer_spec, layer_name),
                         )[0]
                         kv_caches.append(kv_cache)
 

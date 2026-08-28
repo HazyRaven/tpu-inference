@@ -2717,6 +2717,177 @@ class TestKVCacheManager:
         assert specs["full_layer"].single_projection is True
         assert specs["swa_layer"].single_projection is False
 
+    def test_initialize_kv_cache_single_projection_preservation_from_model_config(self):
+        """Verify that initialize_kv_cache applies single_projection (Dim 2 == 1) when
+        attention_k_eq_v is True in model_config, even if layer_spec is a standard
+        dataclass without dynamic monkey-patched attributes."""
+        mock_text_cfg = MagicMock(attention_k_eq_v=True)
+        mock_hf_config = MagicMock(text_config=mock_text_cfg)
+        mock_model_config = MagicMock(hf_config=mock_hf_config, use_mla=False)
+        self.runner.model_config = mock_model_config
+
+        # Standard vLLM dataclass without object.__setattr__(..., "single_projection", True)
+        global_spec = FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=4,
+            head_size=512,
+            dtype=torch.float8_e5m2,
+        )
+        num_blocks = 32
+        groups = [
+            KVCacheGroupSpec(
+                layer_names=["layer.0"],
+                kv_cache_spec=global_spec,
+            )
+        ]
+        tensors = [
+            KVCacheTensor(
+                size=num_blocks * global_spec.page_size_bytes,
+                layers=["layer.0"],
+                layer_stride=num_blocks * global_spec.page_size_bytes,
+                block_stride=global_spec.page_size_bytes,
+            )
+        ]
+        kv_cache_config = KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=tensors,
+            kv_cache_groups=groups,
+        )
+
+        self.runner.initialize_kv_cache(kv_cache_config)
+
+        assert len(self.runner.kv_caches) == 1
+        # In FP8 (kv_packing=4) with 4 KV heads:
+        # Single projection (multiplier=1): align_to(4*1, 4) // 4 = 1 packed word.
+        # Dual projection (multiplier=2): align_to(4*2, 4) // 4 = 2 packed words.
+        assert self.runner.kv_caches[0].shape == (32, 16, 1, 4, 512)
+
+    def test_initialize_kv_cache_single_projection_dataclass_copy_stripping(self):
+        """Verify that when get_kv_cache_spec produces specs and vLLM reconstructs them
+        via dataclass copy (stripping object.__setattr__ fields), initialize_kv_cache
+        still allocates single-projection tensors (Dim 2 == 1)."""
+        mock_text_cfg = MagicMock(
+            attention_k_eq_v=True,
+            layer_types=["full_attention"],
+        )
+        mock_hf_config = MagicMock(text_config=mock_text_cfg)
+        mock_model_config = MagicMock(
+            hf_config=mock_hf_config,
+            hf_text_config=mock_text_cfg,
+            use_mla=False,
+            get_total_num_kv_heads=lambda: 4,
+            get_head_size=lambda: 512,
+            get_num_layers=lambda p: 1,
+        )
+        self.runner.model_config = mock_model_config
+        self.runner.kv_cache_dtype = torch.float8_e5m2
+        self.runner.vllm_config.compilation_config.static_forward_context = {}
+
+        # Sizing / spec generation
+        specs = self.runner.get_kv_cache_spec()
+        assert "layer.0" in specs
+        original_spec = specs["layer.0"]
+
+        # Simulate vLLM engine dataclass copy (re-instantiates dataclass, dropping monkey-patched attributes)
+        cloned_spec = FullAttentionSpec(
+            block_size=original_spec.block_size,
+            num_kv_heads=original_spec.num_kv_heads,
+            head_size=original_spec.head_size,
+            dtype=original_spec.dtype,
+        )
+        assert not hasattr(cloned_spec, "single_projection") or getattr(cloned_spec, "single_projection", False) is False
+
+        num_blocks = 32
+        groups = [KVCacheGroupSpec(layer_names=["layer.0"], kv_cache_spec=cloned_spec)]
+        tensors = [
+            KVCacheTensor(
+                size=num_blocks * cloned_spec.page_size_bytes,
+                layers=["layer.0"],
+                layer_stride=num_blocks * cloned_spec.page_size_bytes,
+                block_stride=cloned_spec.page_size_bytes,
+            )
+        ]
+        kv_cache_config = KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=tensors,
+            kv_cache_groups=groups,
+        )
+
+        self.runner.initialize_kv_cache(kv_cache_config)
+
+        assert len(self.runner.kv_caches) == 1
+        assert self.runner.kv_caches[0].shape == (32, 16, 1, 4, 512)
+
+    def test_solver_to_physical_allocation_memory_budget_consistency(self):
+        """Verify that the physical JAX array memory allocated by initialize_kv_cache
+        does not exceed the memory budget computed by _maybe_set_compact_swa_num_blocks_override.
+        On the buggy code, the solver budgets 10 layers * 1.17 GiB = 11.7 GiB, but initialize_kv_cache
+        allocates 10 layers * 2.34 GiB = 23.4 GiB."""
+        mock_text_cfg = MagicMock(
+            attention_k_eq_v=True,
+            layer_types=["full_attention"] * 10 + ["sliding_attention"] * 50,
+        )
+        mock_hf_config = MagicMock(text_config=mock_text_cfg)
+        mock_model_config = MagicMock(
+            hf_config=mock_hf_config,
+            hf_text_config=mock_text_cfg,
+            use_mla=False,
+            get_total_num_kv_heads=lambda: 4,
+            get_head_size=lambda: 512,
+            get_num_layers=lambda p: 60,
+        )
+        self.runner.model_config = mock_model_config
+        self.runner.kv_cache_dtype = torch.float8_e5m2
+        self.runner.cache_config.block_size = 16
+        self.runner.cache_config.gpu_memory_utilization = 0.85
+        self.runner.vllm_config.compilation_config.static_forward_context = {}
+
+        # Sizing solver with mock HBM usage (4 chips on v6e-4 with ~75.08 GiB total available)
+        total_hbm_per_chip = int(31.24 * (2**30))
+        used_hbm_per_chip = int(7.79 * (2**30))
+        with patch("tpu_inference.runner.kv_cache_manager.utils.hbm_usage_bytes",
+                   return_value=[(used_hbm_per_chip, total_hbm_per_chip)] * 4):
+            specs = self.runner.get_kv_cache_spec()
+
+        full_num_blocks = self.runner.cache_config.num_gpu_blocks_override
+        assert full_num_blocks is not None
+        assert full_num_blocks >= 38000  # Expecting ~38,341 blocks
+
+        # Build vLLM KVCacheConfig with 10 global layers
+        global_layers = [f"layer.{i}" for i in range(10)]
+        global_spec = FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=4,
+            head_size=512,
+            dtype=torch.float8_e5m2,
+        )
+        groups = [KVCacheGroupSpec(layer_names=global_layers, kv_cache_spec=global_spec)]
+        tensors = [
+            KVCacheTensor(
+                size=full_num_blocks * global_spec.page_size_bytes * 10,
+                layers=global_layers,
+                layer_stride=full_num_blocks * global_spec.page_size_bytes,
+                block_stride=global_spec.page_size_bytes,
+            )
+        ]
+        kv_cache_config = KVCacheConfig(
+            num_blocks=full_num_blocks,
+            kv_cache_tensors=tensors,
+            kv_cache_groups=groups,
+        )
+
+        self.runner.initialize_kv_cache(kv_cache_config)
+
+        # Total memory of 10 global layers on 1 chip
+        total_global_bytes = sum(cache.nbytes for cache in self.runner.kv_caches)
+        total_global_gib = total_global_bytes / (2**30)
+
+        # Budget for 10 global layers is ~11.7 GiB (38,341 * 32 KiB * 10).
+        # On buggy code, it allocates 23.4 GiB (38,341 * 64 KiB * 10).
+        assert total_global_gib <= 12.5, f"Allocated {total_global_gib:.2f} GiB exceeds budget of ~11.7 GiB!"
+
+
+
 
 
 
