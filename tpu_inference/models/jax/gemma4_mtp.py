@@ -28,7 +28,6 @@ from tpu_inference.layers.jax import JaxModule
 from tpu_inference.layers.jax.embed import JaxEmbed
 from tpu_inference.layers.jax.linear import JaxEinsum, JaxLinear, JaxLmHead
 from tpu_inference.layers.jax.norm import JaxRmsNorm
-from tpu_inference.layers.jax.pp_utils import make_layers
 from tpu_inference.layers.jax.rope_interface import apply_rope
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
 from tpu_inference.logger import init_logger
@@ -450,9 +449,8 @@ class Gemma4MultiTokenPredictor(JaxModule):
             prefix=prefix + ".post_projection",
         )
 
-        self.start_layer, self.end_layer, self.layers = make_layers(
-            self.num_mtp_layers,
-            lambda layer_index: Gemma4MTPDecoderLayer(
+        self.layers = nnx.List([
+            Gemma4MTPDecoderLayer(
                 config=self.config,
                 layer_idx=layer_index,
                 dtype=dtype,
@@ -461,8 +459,11 @@ class Gemma4MultiTokenPredictor(JaxModule):
                 kv_cache_dtype=vllm_config.cache_config.cache_dtype,
                 quant_config=vllm_config.quant_config,
                 prefix=f"{prefix}.layers.{layer_index}",
-            ),
-        )
+            )
+            for layer_index in range(self.num_mtp_layers)
+        ])
+        self.start_layer = 0
+        self.end_layer = self.num_mtp_layers
 
         self.norm = JaxRmsNorm(
             self.hidden_size,
