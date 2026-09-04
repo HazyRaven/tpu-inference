@@ -58,6 +58,7 @@ class Eagle3Proposer:
         self.draft_model_config = self.speculative_config.draft_model_config
         self.method = self.speculative_config.method
         self.is_gemma4_mtp = is_gemma4_mtp(self.speculative_config)
+        self.is_mtp = (self.method == "mtp" or self.is_gemma4_mtp)
 
         self.runner = runner
         self.mesh = runner.mesh
@@ -293,7 +294,7 @@ class Eagle3Proposer:
         next_token_ids: jax.Array,
         num_reqs: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        if self.method == "mtp":
+        if self.is_mtp:
             target_hidden_states = aux_hidden_states[0]
         else:
             target_hidden_states = jnp.concatenate(aux_hidden_states, axis=-1)
@@ -545,7 +546,7 @@ class Eagle3Proposer:
                                                        last_token_indices)
 
         def _select(positions, residual, hidden_states, last_token_indices):
-            if self.method == "mtp":
+            if self.is_mtp:
                 # We need a separate branch for MTP because:
                 # 1. MTP uses final target output hidden states directly as inputs for the next step,
                 #    whereas Eagle uses intermediate residuals.
