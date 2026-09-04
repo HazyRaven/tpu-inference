@@ -394,3 +394,14 @@ def test_mtp_calibration_forward_unshared_embeddings_and_heterogeneous_kv(rng, m
     assert len(accessed_caches) == 4
     # Verify Draft Layer 3 accessed kv_caches[59] (Full Attention 512-dim), not kv_caches[3]
     assert accessed_caches[3] is kv_caches[59]
+
+
+def test_compute_logits_softcapping_masked_embedding(rng, mesh, mock_vllm_config):
+    """Verifies that when masked_embedding is active, final_logit_softcapping is NOT applied
+    to masked logits, ensuring unselected tokens remain -inf rather than collapsing to -30.0."""
+    model, _ = _setup_test_model(rng, mesh, mock_vllm_config, use_ordered_embeddings=True)
+    model.final_logit_softcapping = 30.0
+    model.masked_embedding.token_ordering.set_value(jnp.arange(256000, dtype=jnp.int32))
+    hidden_states = jnp.ones((1, 4096), dtype=jnp.bfloat16)
+    logits = model.compute_logits(hidden_states)
+    assert jnp.isneginf(logits[0, 250000]) or logits[0, 250000] == jnp.finfo(logits.dtype).min, f"Unselected token logit was {float(logits[0, 250000])}, expected -inf"

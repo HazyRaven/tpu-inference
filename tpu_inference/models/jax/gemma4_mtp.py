@@ -555,9 +555,18 @@ class Gemma4MTPForCausalLM(JaxModule, LoadableWithIterator):
             prefix="model",
         )
 
-        draft_config = vllm_config.speculative_config.draft_model_config.hf_config
-        text_config = draft_config.text_config
+        draft_model_config = getattr(vllm_config.speculative_config, "draft_model_config", None) if vllm_config.speculative_config else None
+        draft_config = getattr(draft_model_config, "hf_config", None) if draft_model_config is not None else None
+        text_config = getattr(draft_config, "text_config", draft_config)
         dtype = vllm_config.model_config.dtype
+
+        gen_cfg = getattr(draft_model_config, "try_get_generation_config", lambda: None)()
+        suppress_tokens = (gen_cfg.get("suppress_tokens") if isinstance(gen_cfg, dict) else getattr(gen_cfg, "suppress_tokens", None)) if gen_cfg else None
+        if suppress_tokens is None and draft_config is not None:
+            suppress_tokens = getattr(draft_config, "suppress_tokens", None)
+            if suppress_tokens is None and hasattr(draft_config, "text_config"):
+                suppress_tokens = getattr(draft_config.text_config, "suppress_tokens", None)
+        self._suppress_token_ids = jnp.array(suppress_tokens, dtype=jnp.int32) if suppress_tokens else None
 
         self.final_logit_softcapping = getattr(text_config,
                                                "final_logit_softcapping", None)
@@ -679,19 +688,20 @@ class Gemma4MTPForCausalLM(JaxModule, LoadableWithIterator):
 
     def compute_logits(self, hidden_states: jax.Array) -> jax.Array:
         if self.masked_embedding is not None:
-            return self.masked_embedding(
+            logits = self.masked_embedding(
                 hidden_states,
                 self._get_full_lm_head_weight(),
             )
-
-        if hasattr(self, "lm_head"):
-            logits = self.lm_head(hidden_states)
         else:
-            logits = self.model.embed_tokens.decode(hidden_states)
-
-        if self.final_logit_softcapping is not None:
-            logits = (jnp.tanh(logits / self.final_logit_softcapping) *
-                      self.final_logit_softcapping)
+            if hasattr(self, "lm_head"):
+                logits = self.lm_head(hidden_states)
+            else:
+                logits = self.model.embed_tokens.decode(hidden_states)
+            if self.final_logit_softcapping is not None:
+                logits = (jnp.tanh(logits / self.final_logit_softcapping) *
+                          self.final_logit_softcapping)
+        if self._suppress_token_ids is not None and len(self._suppress_token_ids) > 0:
+            logits = logits.at[:, self._suppress_token_ids].set(-jnp.inf)
         return logits
 
     def get_top_tokens(self, hidden_states: jax.Array) -> jax.Array:
