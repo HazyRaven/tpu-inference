@@ -368,3 +368,22 @@ def test_update_inputs_for_loop_speculation_mrope():
     assert new_seq_lens[0] == 6
     assert new_block_tables[0] == 1
     assert new_block_tables[1] == 2
+
+
+def test_proposer_method_decoupling():
+    """Verifies that Eagle3Proposer treats Gemma 4 MTP as MTP architecture even if
+    method string is set to a non-mtp identifier."""
+    from unittest.mock import MagicMock
+    from tpu_inference.spec_decode.jax.eagle3 import Eagle3Proposer
+    runner = MagicMock()
+    runner.model_config.seed = 42
+    runner.max_num_tokens = 2048
+    vllm_config = runner.vllm_config
+    vllm_config.model_config.seed = 42
+    vllm_config.max_num_tokens = 2048
+    vllm_config.speculative_config.method = "spec_draft_custom"
+    vllm_config.speculative_config.draft_model_config.hf_config.model_type = "gemma4_assistant"
+    vllm_config.speculative_config.draft_model_config.architectures = ["Gemma4AssistantForCausalLM"]
+    proposer = Eagle3Proposer(runner, vllm_config)
+    assert proposer.is_mtp is True
+

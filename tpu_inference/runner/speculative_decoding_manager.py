@@ -24,6 +24,7 @@ from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
 from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.models.common.kv_share import is_gemma4_mtp
 from tpu_inference.runner import utils as runner_utils
 from tpu_inference.runner.utils import SpecDecodeMetadata
 from tpu_inference.spec_decode.jax.eagle3 import Eagle3Proposer
@@ -284,7 +285,8 @@ class SpeculativeDecodingManager:
             (next_prompt_token_id, is_in_prefill, num_reqs_dp),
             sharding=(PartitionSpec(ShardingAxisName.ATTN_DATA)))
 
-        if self.runner.speculative_config.method == "mtp":
+        if self.runner.speculative_config.method == "mtp" or is_gemma4_mtp(
+                self.runner.speculative_config):
             aux_hidden_states_for_drafter = (hidden_states, )
         else:
             aux_hidden_states_for_drafter = aux_hidden_states
