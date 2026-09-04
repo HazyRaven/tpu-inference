@@ -207,3 +207,73 @@ class TestGemma4MTPForCausalLM:
             # Verify that all layers are missing on this rank (PPMissingLayer)
             for idx in range(4):
                 assert isinstance(model.model.layers[idx], PPMissingLayer)
+
+
+_MODEL_CACHE = {}
+
+
+def _setup_test_model(rng, mesh, mock_vllm_config, use_ordered_embeddings=False):
+    key = use_ordered_embeddings
+    if key in _MODEL_CACHE:
+        return _MODEL_CACHE[key]
+    init_pp_distributed_environment(
+        ip="",
+        rank=0,
+        world_size=1,
+        device=jax.devices()[0],
+        need_pp=False,
+    )
+    vllm_config = mock_vllm_config("google/gemma-4-31B-it", "auto")
+    vllm_config.speculative_config = MagicMock()
+    draft_model_config = MagicMock()
+    draft_hf_config = DummyDraftConfig(use_ordered_embeddings=use_ordered_embeddings)
+    draft_hf_config.backbone_hidden_size = 5120
+    draft_hf_config.text_config.hidden_size = 4096
+    draft_hf_config.text_config.vocab_size = 256000
+    draft_model_config.hf_config = draft_hf_config
+    draft_model_config.get_hidden_size = lambda: 4096
+    vllm_config.speculative_config.draft_model_config = draft_model_config
+    vllm_config.quant_config = get_tpu_quantization_config(vllm_config)
+
+    with jax.set_mesh(mesh), set_current_vllm_config(vllm_config):
+        model = Gemma4MTPForCausalLM(vllm_config, rng, mesh)
+    _MODEL_CACHE[key] = (model, vllm_config)
+    return model, vllm_config
+
+
+def test_mtp_embed_init_features_equals_hidden_size(rng, mesh, mock_vllm_config):
+    """Verifies Gemma4MultiTokenPredictor.embed_tokens.features == hidden_size (placeholder contract)."""
+    model, _ = _setup_test_model(rng, mesh, mock_vllm_config)
+    assert model.model.embed_tokens.features == 4096
+    assert model.model.hidden_size == 4096
+    assert model.model.backbone_hidden_size == 5120
+
+
+def test_mtp_tied_lm_head_loading(rng, mesh, mock_vllm_config):
+    """Verifies that load_weights populates lm_head.weight when tie_word_embeddings is True,
+    even when backbone_hidden_size != hidden_size."""
+    import torch
+    model, _ = _setup_test_model(rng, mesh, mock_vllm_config)
+    assert model.model.backbone_hidden_size != model.model.hidden_size
+
+    fake_embed_tensor = torch.ones(
+        (model.model.vocab_size, model.model.hidden_size), dtype=torch.bfloat16)
+    weights_iterator = [("model.embed_tokens.weight", fake_embed_tensor)]
+
+    loaded_keys = model.load_weights(weights_iterator)
+
+    assert "model.embed_tokens.weight" in loaded_keys
+    assert "lm_head.weight" in loaded_keys, "lm_head.weight must be loaded when tie_word_embeddings is True"
+    assert model.lm_head.weight.shape == (model.model.hidden_size, model.model.vocab_size)
+
+
+def test_mtp_o_proj_partition_spec(rng, mesh, mock_vllm_config):
+    """Verifies that Gemma4MTPAttention o_proj kernel is sharded along Axis 0 (num_heads)
+    with PartitionSpec('model', None, None) to avoid all-to-all collectives."""
+    from flax.nnx import get_partition_spec
+    from jax.sharding import PartitionSpec
+    model, _ = _setup_test_model(rng, mesh, mock_vllm_config)
+    attn = model.model.layers[0].self_attn
+    spec = get_partition_spec(attn.o_proj.weight)
+    assert spec == PartitionSpec("model", None, None)
+
