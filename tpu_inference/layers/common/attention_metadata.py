@@ -158,6 +158,19 @@ class GroupedAttentionMetadata(dict):
             for name in names
         })
 
+    @property
+    def query_start_loc(self) -> jax.Array:
+        return self.groups[0].query_start_loc
+
+    @property
+    def seq_lens(self) -> jax.Array:
+        return self.groups[0].seq_lens
+
+    @property
+    def input_positions(self) -> jax.Array:
+        return self.groups[0].input_positions
+
+
 
 jax.tree_util.register_pytree_node(
     GroupedAttentionMetadata,

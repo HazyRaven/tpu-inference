@@ -305,3 +305,55 @@ def test_mtp_pp_unpartitioned_layers(rng, mesh, mock_vllm_config):
         init_pp_distributed_environment(ip="", rank=0, world_size=1, device=jax.devices()[0], need_pp=False)
 
 
+def test_mtp_heterogeneous_swa_routing(rng, mesh, mock_vllm_config):
+    """Verifies that Gemma4MultiTokenPredictor routes heterogeneous per-group block tables:
+    draft layers 0..2 attend layer.58 (SWA Group 4) while draft layer 3 attends layer.59 (Full Group 5)."""
+    from unittest.mock import MagicMock
+    from tpu_inference.layers.common.attention_metadata import AttentionMetadata
+
+    model, _ = _setup_test_model(rng, mesh, mock_vllm_config)
+    model.model.config.layer_redirects = {
+        "draft_layer.0": "layer.58",
+        "draft_layer.1": "layer.58",
+        "draft_layer.2": "layer.58",
+        "draft_layer.3": "layer.59",
+    }
+
+    swa_metadata = MagicMock(spec=AttentionMetadata)
+    swa_metadata.group_id = 4
+    full_metadata = MagicMock(spec=AttentionMetadata)
+    full_metadata.group_id = 5
+
+    dict_attn_metadata = {
+        "layer.58": swa_metadata,
+        "layer.59": full_metadata,
+    }
+
+    passed_metadata = []
+    for layer in model.model.layers:
+        def make_spy(l):
+            def spy_call(kv_cache, hidden_states, attention_metadata):
+                passed_metadata.append(attention_metadata)
+                return kv_cache, hidden_states, None
+            return spy_call
+        layer.__call__ = make_spy(layer)
+
+    kv_caches = [jnp.zeros((1,)) for _ in range(4)]
+    hidden_states = jnp.zeros((1, 5120), dtype=jnp.bfloat16)
+    input_ids = jnp.array([42], dtype=jnp.int32)
+    orig_weight = model.model.embed_tokens.weight.value
+    try:
+        model.model.embed_tokens.weight.value = jnp.zeros(
+            (model.model.vocab_size, model.model.backbone_hidden_size), dtype=jnp.bfloat16)
+        model.model(kv_caches, input_ids, hidden_states, dict_attn_metadata)
+    finally:
+        model.model.embed_tokens.weight.value = orig_weight
+
+    assert len(passed_metadata) == 4
+    assert passed_metadata[0] is swa_metadata
+    assert passed_metadata[1] is swa_metadata
+    assert passed_metadata[2] is swa_metadata
+    assert passed_metadata[3] is full_metadata
+
+
+

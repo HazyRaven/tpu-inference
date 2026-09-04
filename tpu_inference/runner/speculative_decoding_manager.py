@@ -238,7 +238,7 @@ class SpeculativeDecodingManager:
         hidden_states: jnp.ndarray,
     ) -> list[list[int]] | jnp.ndarray:
         assert isinstance(self.runner.drafter, Eagle3Proposer)
-        if isinstance(attn_metadata, dict):
+        if isinstance(attn_metadata, dict) and not is_gemma4_mtp(self.runner.speculative_config):
             # When multiple KV cache groups are used (e.g., in hybrid models),
             # attn_metadata becomes a dict mapping layer names to AttentionMetadata.
             # Since all groups share the same seq_lens and input_positions, any would work for those.
@@ -255,7 +255,8 @@ class SpeculativeDecodingManager:
                 attn_metadata = next(iter(attn_metadata.values()))
 
         req_ids = self.runner.input_batch.req_ids
-        max_num_seqs = attn_metadata.seq_lens.shape[0]
+        ref_metadata = next(iter(attn_metadata.values())) if isinstance(attn_metadata, dict) else attn_metadata
+        max_num_seqs = ref_metadata.seq_lens.shape[0]
         next_prompt_token_id = np.zeros(max_num_seqs, dtype=np.int32)
         is_in_prefill = np.zeros(max_num_seqs, dtype=np.int32)
 

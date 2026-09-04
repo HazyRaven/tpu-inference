@@ -567,6 +567,7 @@ class KVCacheManager:
                     # Compute cross-model redirects and register them directly in shared_kv_cache_layers.
                     redirects = compute_mtp_kv_share_map(
                         draft_hf_config, text_config)
+                    draft_hf_config.layer_redirects = redirects
                     for draft_layer, target_layer in redirects.items():
                         self.shared_kv_cache_layers[draft_layer] = target_layer
                 elif method in ("eagle3", "dflash"):
