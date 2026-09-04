@@ -277,3 +277,31 @@ def test_mtp_o_proj_partition_spec(rng, mesh, mock_vllm_config):
     spec = get_partition_spec(attn.o_proj.weight)
     assert spec == PartitionSpec("model", None, None)
 
+
+def test_mtp_pp_unpartitioned_layers(rng, mesh, mock_vllm_config):
+    """Verifies that all draft layers are fully instantiated as Gemma4MTPDecoderLayer
+    even in a multi-rank pipeline parallel configuration (PP > 1), preventing PPMissingLayer stubs."""
+    from tpu_inference.distributed.jax_parallel_state import init_pp_distributed_environment
+    from tpu_inference.layers.jax.pp_utils import PPMissingLayer
+    try:
+        init_pp_distributed_environment(ip="", rank=1, world_size=2, device=jax.devices()[0], need_pp=False)
+        vllm_config = mock_vllm_config("google/gemma-4-31B-it", "auto")
+        vllm_config.parallel_config = MagicMock()
+        vllm_config.parallel_config.pipeline_parallel_size = 2
+        vllm_config.parallel_config.rank = 1
+        vllm_config.speculative_config = MagicMock()
+        draft_model_config = MagicMock()
+        draft_hf_config = DummyDraftConfig(use_ordered_embeddings=False)
+        draft_model_config.hf_config = draft_hf_config
+        draft_model_config.get_hidden_size = lambda: 4096
+        vllm_config.speculative_config.draft_model_config = draft_model_config
+        with jax.set_mesh(mesh), set_current_vllm_config(vllm_config):
+            model = Gemma4MTPForCausalLM(vllm_config, rng, mesh)
+        assert len(model.model.layers) == 4
+        for idx, layer in enumerate(model.model.layers):
+            assert not isinstance(layer, PPMissingLayer), f"Layer {idx} must not be PPMissingLayer"
+            assert isinstance(layer, Gemma4MTPDecoderLayer)
+    finally:
+        init_pp_distributed_environment(ip="", rank=0, world_size=1, device=jax.devices()[0], need_pp=False)
+
+
