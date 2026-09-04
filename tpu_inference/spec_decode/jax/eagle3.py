@@ -552,10 +552,14 @@ class Eagle3Proposer:
 
     def _get_draft_token_ids(self, state_leaves: Any,
                              hidden_states: jax.Array) -> jax.Array:
-        lora_metadata = None
-        logits = self.compute_logits_fn(state_leaves, hidden_states,
-                                        lora_metadata)
-        draft_token_ids = jnp.argmax(logits, axis=-1)
+        if (hasattr(self, "model") and hasattr(self.model, "get_top_tokens")
+                and getattr(self.model, "masked_embedding", None) is not None):
+            draft_token_ids = self.model.get_top_tokens(hidden_states)
+        else:
+            lora_metadata = None
+            logits = self.compute_logits_fn(state_leaves, hidden_states,
+                                            lora_metadata)
+            draft_token_ids = jnp.argmax(logits, axis=-1)
         return lax.with_sharding_constraint(
             draft_token_ids,
             NamedSharding(self.mesh,
