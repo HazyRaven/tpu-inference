@@ -68,8 +68,7 @@ class Eagle3Proposer:
         self.rng_key = jax.random.key(self.vllm_config.model_config.seed)
         self.max_num_tokens = runner.max_num_tokens
         self.token_arange = jnp.arange(self.max_num_tokens)
-        self.constant_draft_positions = self.speculative_config.use_gemma4_mtp(
-        )
+        self.constant_draft_positions = self.is_gemma4_mtp
 
     def load_model(self, target_model: Any) -> None:
         """Loads the draft model."""
@@ -594,18 +593,20 @@ class Eagle3Proposer:
             layer_name_to_kvcache_index=tuple(
                 self.runner.layer_name_to_kvcache_index.items()))
 
+    _PROPOSE_COMPILER_OPTIONS = {
+        "xla_tpu_all_gather_collective_matmul_mode":
+        "post_spmd_conservative",
+        "xla_tpu_reduce_scatter_collective_matmul_mode":
+        "post_spmd_conservative"
+    } if jax.default_backend() == "tpu" else {}
+
     @jax.jit(
         donate_argnames=("kv_caches", ),
         out_shardings=(
             None,  # kv_caches - keep original sharding
             None,  # draft_token_ids
         ),
-        compiler_options={
-            "xla_tpu_all_gather_collective_matmul_mode":
-            "post_spmd_conservative",
-            "xla_tpu_reduce_scatter_collective_matmul_mode":
-            "post_spmd_conservative"
-        },
+        compiler_options=_PROPOSE_COMPILER_OPTIONS,
         static_argnums=(
             0,
             7,
