@@ -230,7 +230,7 @@ class Gemma4MTPAttention(JaxModule):
             (self.num_heads, self.head_dim, self.hidden_size),
             bias_shape=(self.hidden_size, ) if config.attention_bias else None,
             param_dtype=dtype,
-            kernel_init=nnx.with_partitioning(init_fn, (None, "model", None)),
+            kernel_init=nnx.with_partitioning(init_fn, ("model", None, None)),
             bias_init=nnx.with_partitioning(init_fn, (None, ))
             if config.attention_bias else None,
             rngs=rng,
