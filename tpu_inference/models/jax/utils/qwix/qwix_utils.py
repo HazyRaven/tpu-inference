@@ -212,6 +212,33 @@ def qwix_quantize_nnx_model(model: nnx.Module, qwix_config: List[dict],
                           query_start_loc=query_start_loc,
                           request_distribution=request_distribution),
     }
+    import inspect
+    sig = inspect.signature(model.__call__)
+    if "hidden_states" in sig.parameters:
+        backbone_hidden_size = getattr(
+            model, "backbone_hidden_size",
+            getattr(getattr(model, "model", None), "backbone_hidden_size", None))
+        if backbone_hidden_size is None:
+            draft_cfg = getattr(
+                getattr(getattr(model, "vllm_config", None),
+                        "speculative_config", None), "draft_model_config",
+                None)
+            draft_hf = getattr(draft_cfg, "hf_config", None)
+            backbone_hidden_size = getattr(draft_hf, "backbone_hidden_size",
+                                           None)
+        if backbone_hidden_size is None:
+            hf_cfg = getattr(
+                getattr(model, "vllm_config", None), "model_config", None)
+            hf_cfg = getattr(hf_cfg, "hf_config", None)
+            backbone_hidden_size = getattr(hf_cfg, "backbone_hidden_size",
+                                           None)
+        if backbone_hidden_size is None:
+            text_cfg = getattr(hf_cfg, "text_config", hf_cfg)
+            backbone_hidden_size = getattr(text_cfg, "hidden_size", 5376)
+        hidden_states = jnp.zeros((len(input_ids), backbone_hidden_size),
+                                  dtype=jnp.bfloat16)
+        hidden_states = device_array(mesh, hidden_states)
+        model_input["hidden_states"] = hidden_states
     model = qwix.quantize_model(model, qwix.PtqProvider(qwix_rules),
                                 **model_input)
     return model
