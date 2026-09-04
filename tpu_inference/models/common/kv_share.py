@@ -23,6 +23,26 @@ Any JAX model whose HF config carries these attributes (currently
 Gemma-4 E2B / E4B) can use this helper. New JAX models that introduce
 KV-share via the same HF convention pick it up automatically.
 """
+from typing import Any
+
+
+def is_gemma4_mtp(speculative_config: Any) -> bool:
+    """True if the draft model is a Gemma 4 MTP / Assistant architecture."""
+    if speculative_config is None:
+        return False
+    if callable(getattr(speculative_config, "use_gemma4_mtp", None)) and speculative_config.use_gemma4_mtp():
+        return True
+    draft_cfg = getattr(speculative_config, "draft_model_config", None)
+    if draft_cfg is None:
+        return False
+    hf_cfg = getattr(draft_cfg, "hf_config", None)
+    inner_hf_cfg = getattr(hf_cfg, "model", hf_cfg)
+    model_types = {getattr(hf_cfg, "model_type", None), getattr(inner_hf_cfg, "model_type", None)}
+    gemma4_types = {"gemma4_mtp", "gemma4_assistant", "gemma4_unified_assistant"}
+    archs = set(getattr(draft_cfg, "architectures", []) or [])
+    archs.update(getattr(hf_cfg, "architectures", []) or [])
+    gemma4_archs = {"Gemma4MTPModel", "Gemma4MTPForCausalLM", "Gemma4AssistantForCausalLM", "Gemma4MultiTokenPredictor"}
+    return bool((model_types & gemma4_types) or (archs & gemma4_archs))
 
 
 def compute_kv_share_map(text_config) -> dict:

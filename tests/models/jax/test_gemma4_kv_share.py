@@ -323,3 +323,15 @@ def test_double_wide_mlp_off(mesh, rng=jax.random.PRNGKey(0)):
     for layer in model.layers:
         assert layer.mlp.gate_up_proj.weight.shape == (32,
                                                        2 * intermediate_size)
+
+
+def test_is_gemma4_mtp_detection():
+    """Verifies is_gemma4_mtp returns True for raw official checkpoint configs
+    (model_type='gemma4_assistant') without relying on upstream hf_config_override."""
+    from tpu_inference.models.common.kv_share import is_gemma4_mtp
+    mock_spec_config = MagicMock()
+    mock_spec_config.use_gemma4_mtp.return_value = False
+    mock_spec_config.draft_model_config.hf_config.model_type = "gemma4_assistant"
+    mock_spec_config.draft_model_config.architectures = ["Gemma4AssistantForCausalLM"]
+    assert is_gemma4_mtp(mock_spec_config) is True
+

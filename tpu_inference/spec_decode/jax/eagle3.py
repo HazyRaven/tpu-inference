@@ -26,6 +26,7 @@ from vllm.config import VllmConfig
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.logger import init_logger
+from tpu_inference.models.common.kv_share import is_gemma4_mtp
 from tpu_inference.models.common.model_loader import (get_model,
                                                       resolve_model_impl_type)
 from tpu_inference.utils import device_array
@@ -56,6 +57,7 @@ class Eagle3Proposer:
         assert self.speculative_config is not None
         self.draft_model_config = self.speculative_config.draft_model_config
         self.method = self.speculative_config.method
+        self.is_gemma4_mtp = is_gemma4_mtp(self.speculative_config)
 
         self.runner = runner
         self.mesh = runner.mesh
@@ -145,7 +147,7 @@ class Eagle3Proposer:
                         "Draft model does not have embedding. Setting draft model's embed_tokens to target model's embed"
                     )
                     draft_embed_param.value = target_embed_param.value
-                elif self.speculative_config.use_gemma4_mtp():
+                elif self.is_gemma4_mtp:
                     logger.info(
                         "Setting draft model's embed_tokens to target model's embed unconditionally (Gemma4-MTP/KV-sharing layout)"
                     )
