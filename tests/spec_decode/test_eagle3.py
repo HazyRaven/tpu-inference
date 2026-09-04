@@ -387,3 +387,45 @@ def test_proposer_method_decoupling():
     proposer = Eagle3Proposer(runner, vllm_config)
     assert proposer.is_mtp is True
 
+
+def test_proposer_grouped_attention_metadata_handling():
+    """Verifies that Eagle3Proposer preserves GroupedAttentionMetadata without crashing
+    on dataclasses.replace or attribute lookups during input preparation."""
+    from tpu_inference.layers.common.attention_metadata import (
+        AttentionMetadata,
+        GroupedAttentionMetadata,
+    )
+    from tpu_inference.spec_decode.jax.eagle3 import _replace_attn_metadata
+
+    group0 = AttentionMetadata(
+        input_positions=jnp.array([[0, 1]]),
+        block_tables=jnp.array([1, 2, 3]),
+        seq_lens=jnp.array([2]),
+        query_start_loc=jnp.array([0, 2]),
+    )
+    group1 = AttentionMetadata(
+        input_positions=jnp.array([[0, 1]]),
+        block_tables=jnp.array([10, 20, 30]),
+        seq_lens=jnp.array([2]),
+        query_start_loc=jnp.array([0, 2]),
+    )
+    grouped = GroupedAttentionMetadata(
+        groups=(group0, group1),
+        layer_names_per_group=(("layer.58", ), ("layer.59", )),
+    )
+
+    # Verify property accessors
+    assert jnp.array_equal(grouped.query_start_loc, group0.query_start_loc)
+    assert jnp.array_equal(grouped.seq_lens, group0.seq_lens)
+    assert jnp.array_equal(grouped.input_positions, group0.input_positions)
+
+    # Verify _replace_attn_metadata preserves individual group block tables
+    new_positions = jnp.array([[2, 3]])
+    updated = _replace_attn_metadata(grouped, input_positions=new_positions)
+    assert isinstance(updated, GroupedAttentionMetadata)
+    assert jnp.array_equal(updated.groups[0].input_positions, new_positions)
+    assert jnp.array_equal(updated.groups[1].input_positions, new_positions)
+    assert jnp.array_equal(updated.groups[0].block_tables, group0.block_tables)
+    assert jnp.array_equal(updated.groups[1].block_tables, group1.block_tables)
+
+

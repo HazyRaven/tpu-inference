@@ -23,7 +23,10 @@ from jax import lax
 from jax.sharding import NamedSharding, PartitionSpec
 from vllm.config import VllmConfig
 
-from tpu_inference.layers.common.attention_metadata import AttentionMetadata
+from tpu_inference.layers.common.attention_metadata import (
+    AttentionMetadata,
+    GroupedAttentionMetadata,
+)
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.logger import init_logger
 from tpu_inference.models.common.kv_share import is_gemma4_mtp
@@ -32,6 +35,26 @@ from tpu_inference.models.common.model_loader import (get_model,
 from tpu_inference.utils import device_array
 
 logger = init_logger(__name__)
+
+
+def _replace_attn_metadata(metadata, **kwargs):
+    block_tables = kwargs.get("block_tables")
+    if isinstance(metadata, GroupedAttentionMetadata):
+        return GroupedAttentionMetadata(
+            groups=tuple(
+                replace(
+                    g,
+                    **{k: v for k, v in kwargs.items() if k != "block_tables"},
+                    block_tables=g.block_tables if block_tables is None else block_tables,
+                ) for g in metadata.groups),
+            layer_names_per_group=metadata.layer_names_per_group,
+        )
+    if isinstance(metadata, dict):
+        return {
+            k: _replace_attn_metadata(v, **kwargs)
+            for k, v in metadata.items()
+        }
+    return replace(metadata, **kwargs)
 
 
 class Eagle3Proposer:
@@ -657,14 +680,14 @@ class Eagle3Proposer:
                 clamped_positions = positions
                 new_seq_lens = attn_metadata.seq_lens
                 query_start_loc = self._get_loop_query_start_loc(positions)
-                new_block_tables = attn_metadata.block_tables
+                new_block_tables = None if self.is_gemma4_mtp else attn_metadata.block_tables
             else:
                 # Eagle3: advance positions sequentially
                 positions, clamped_positions, new_seq_lens, query_start_loc, new_block_tables = self._update_inputs_for_loop_speculation(
                     positions, attn_metadata.seq_lens,
                     attn_metadata.block_tables)
 
-            attn_metadata = replace(
+            attn_metadata = _replace_attn_metadata(
                 attn_metadata,
                 input_positions=clamped_positions,
                 seq_lens=new_seq_lens,

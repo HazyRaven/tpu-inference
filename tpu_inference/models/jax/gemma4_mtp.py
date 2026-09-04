@@ -419,6 +419,12 @@ class Gemma4MultiTokenPredictor(JaxModule):
         self.vocab_size = text_config.vocab_size
         self.num_mtp_layers = text_config.num_hidden_layers
 
+        from tpu_inference.models.common.kv_share import compute_mtp_kv_share_map
+        target_hf_config = getattr(getattr(vllm_config, "model_config", None), "hf_config", None)
+        self.layer_redirects = getattr(self.config, "layer_redirects", None) or (
+            compute_mtp_kv_share_map(self.config, target_hf_config) if target_hf_config else {}
+        )
+
         self.embed_tokens = JaxEmbed(
             num_embeddings=self.vocab_size,
             features=self.hidden_size,
@@ -500,11 +506,18 @@ class Gemma4MultiTokenPredictor(JaxModule):
             else:
                 cache_idx = i
 
+            if isinstance(attention_metadata, dict):
+                redirects = getattr(self, "layer_redirects", None) or getattr(self.config, "layer_redirects", {})
+                target_layer = redirects.get(layer_name, layer_name)
+                layer_attn_metadata = attention_metadata.get(target_layer, attention_metadata.get(layer_name, next(iter(attention_metadata.values()))))
+            else:
+                layer_attn_metadata = attention_metadata
+
             kv_cache = kv_caches[cache_idx]
-            kv_cache, hidden_states, _ = layer(
+            kv_cache, hidden_states, _ = layer.__call__(
                 kv_cache,
                 hidden_states,
-                attention_metadata,
+                layer_attn_metadata,
             )
             kv_caches[cache_idx] = kv_cache
 
