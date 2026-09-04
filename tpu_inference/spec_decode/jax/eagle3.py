@@ -54,6 +54,8 @@ def _replace_attn_metadata(metadata, **kwargs):
             k: _replace_attn_metadata(v, **kwargs)
             for k, v in metadata.items()
         }
+    if block_tables is None and "block_tables" in kwargs:
+        kwargs = {k: v for k, v in kwargs.items() if k != "block_tables"}
     return replace(metadata, **kwargs)
 
 

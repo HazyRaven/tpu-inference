@@ -429,3 +429,16 @@ def test_proposer_grouped_attention_metadata_handling():
     assert jnp.array_equal(updated.groups[1].block_tables, group1.block_tables)
 
 
+def test_replace_attn_metadata_preserves_plain_attention_metadata_block_tables():
+    """Verifies _replace_attn_metadata does NOT overwrite block_tables with None on plain AttentionMetadata."""
+    from tpu_inference.layers.common.attention_metadata import AttentionMetadata
+    from tpu_inference.spec_decode.jax.eagle3 import _replace_attn_metadata
+    meta = AttentionMetadata(
+        input_positions=jnp.array([1]),
+        block_tables=jnp.array([[10, 20]]),
+        seq_lens=jnp.array([1]),
+        query_start_loc=jnp.array([0, 1]),
+    )
+    updated = _replace_attn_metadata(meta, input_positions=jnp.array([2]), block_tables=None)
+    assert updated.block_tables is not None
+    assert jnp.array_equal(updated.block_tables, jnp.array([[10, 20]]))
