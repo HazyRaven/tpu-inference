@@ -356,4 +356,41 @@ def test_mtp_heterogeneous_swa_routing(rng, mesh, mock_vllm_config):
     assert passed_metadata[3] is full_metadata
 
 
+def test_mtp_calibration_forward_unshared_embeddings_and_heterogeneous_kv(rng, mesh, mock_vllm_config):
+    """Verifies forward pass succeeds during calibration when embed_tokens has draft hidden_size (1024)
+    and layer_name_to_kv_cache is None, falling back to redirects for full-attention cache."""
+    model, _ = _setup_test_model(rng, mesh, mock_vllm_config)
+    # Unshared embedding: features == 4096 (mock) != backbone_hidden_size (5120)
+    assert model.model.embed_tokens.features != model.model.backbone_hidden_size
 
+    # Mock redirects mapping draft_layer.3 -> layer.59
+    model.model.layer_redirects = {
+        "draft_layer.0": "layer.58",
+        "draft_layer.1": "layer.58",
+        "draft_layer.2": "layer.58",
+        "draft_layer.3": "layer.59",
+    }
+
+    # Spy on layer calls to capture accessed kv_cache and prevent mock rope failure
+    accessed_caches = []
+    for layer in model.model.layers:
+        def make_spy(l):
+            def spy_call(kv_cache, hidden_states, attention_metadata):
+                accessed_caches.append(kv_cache)
+                return kv_cache, hidden_states, None
+            return spy_call
+        layer.__call__ = make_spy(layer)
+
+    kv_caches = [jnp.zeros((1, 16, 2, 4, 256)) for _ in range(59)] + [jnp.zeros((1, 16, 1, 4, 512))]
+    input_ids = jnp.array([42], dtype=jnp.int32)
+    hidden_states = jnp.zeros((1, 5120), dtype=jnp.bfloat16)
+    attn_metadata = MagicMock()
+
+    kv_caches_out, h_draft, h_backbone = model.model(
+        kv_caches, input_ids, hidden_states, attn_metadata, layer_name_to_kv_cache=None
+    )
+    assert h_draft.shape == (1, 4096)
+    assert h_backbone.shape == (1, 5120)
+    assert len(accessed_caches) == 4
+    # Verify Draft Layer 3 accessed kv_caches[59] (Full Attention 512-dim), not kv_caches[3]
+    assert accessed_caches[3] is kv_caches[59]

@@ -495,14 +495,20 @@ class Gemma4MultiTokenPredictor(JaxModule):
         layer_name_to_kv_cache: Optional[dict] = None,
     ) -> Tuple[List[jax.Array], jax.Array, jax.Array]:
         inputs_embeds = self.embed_input_ids(input_ids)
+        if inputs_embeds.shape[-1] != self.backbone_hidden_size:
+            inputs_embeds = jnp.zeros((*inputs_embeds.shape[:-1], self.backbone_hidden_size), dtype=inputs_embeds.dtype)
 
         combined = jnp.concatenate([inputs_embeds, hidden_states], axis=-1)
         hidden_states = self.pre_projection(combined)
 
         for i, layer in enumerate(self.layers):
             layer_name = f"draft_layer.{i}"
+            redirects = getattr(self.config, "layer_redirects", None) or getattr(self, "layer_redirects", None) or {}
             if layer_name_to_kv_cache and layer_name in layer_name_to_kv_cache:
                 cache_idx = layer_name_to_kv_cache[layer_name]
+            elif layer_name in redirects and isinstance(redirects[layer_name], str) and redirects[layer_name].startswith("layer."):
+                target_idx = int(redirects[layer_name].split(".")[1])
+                cache_idx = target_idx if target_idx < len(kv_caches) else i
             else:
                 cache_idx = i
 
