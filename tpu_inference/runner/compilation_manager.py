@@ -1611,7 +1611,6 @@ class CompilationManager:
         dp_size = self.runner.dp_size
 
         num_kv_cache_groups = len(self.runner.kv_cache_config.kv_cache_groups)
-        draft_kv_cache_group_id = num_kv_cache_groups - 1
         dp_sharding = NamedSharding(
             self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA, ))
 
@@ -1622,7 +1621,12 @@ class CompilationManager:
                                 table,
                                 sharding=dp_sharding)
 
-        block_tables = build_block_table(draft_kv_cache_group_id)
+        # NOTE: there is deliberately no `kv_cache_groups[-1]` draft-group
+        # selection here. Gemma4 MTP allocates no draft KV cache group (see
+        # `Eagle3Proposer.prepare_inputs`), and for >1 group the metadata built
+        # below carries one table per group, matching what the runtime
+        # supplies. The single-group case reads group 0 lazily, inside the
+        # branch that actually needs it.
 
         seq_lens = self._create_dummy_tensor((self.runner.max_num_reqs, ),
                                              jnp.int32, dp_sharding)
@@ -1681,7 +1685,8 @@ class CompilationManager:
                     )
 
                 if num_kv_cache_groups <= 1:
-                    attention_metadata = build_attn(block_tables)
+                    attention_metadata = build_attn(
+                        build_block_table(0) if num_kv_cache_groups else None)
                 else:
                     # Must mirror the runtime structure built in
                     # `_prepare_inputs` (tpu_runner.py), or the precompiled

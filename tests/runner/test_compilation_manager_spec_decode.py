@@ -158,3 +158,63 @@ def test_precompile_mtp_helpers_keeps_flat_metadata_for_single_group():
                 f"cache group must produce a flat AttentionMetadata"
             )
             assert metadata.block_tables.shape == (runner.max_num_reqs * 5,)
+
+
+def test_precompile_mtp_helpers_does_not_read_draft_group_n_minus_1():
+    """NEW-8: the same wrong-KV-group construct, on the precompile side.
+
+    `_precompile_mtp_helpers` selected `kv_cache_groups[-1]` to build one block
+    table, exactly as the proposer did (NEW-3). Gemma 4 MTP allocates no draft
+    KV group, so group N-1 is a *target* group. With per-group tables now built
+    for the multi-group case, that extra read is both redundant and a source of
+    shape disagreement with the runtime.
+
+    Assert each group's table is materialised exactly once: an extra read of
+    group N-1 means the stale single-table selection is still there.
+
+    Must land together with the proposer fix, or the precompiled executable
+    expects a different `block_tables` shape than the runtime supplies.
+    """
+    blocks_per_req = [3, 3, 3, 3, 3, 7]
+    runner = _make_runner(blocks_per_req)
+    reads: list[int] = []
+    real_tables = runner.input_batch.block_table
+
+    class _RecordingTables:
+
+        def __getitem__(self, gid):
+            reads.append(gid)
+            return real_tables[gid]
+
+    runner.input_batch.block_table = _RecordingTables()
+
+    _capture_precompile(runner, "_precompile_mtp_helpers")
+
+    assert reads, "no block tables were built at all"
+    last_gid = len(blocks_per_req) - 1
+    assert reads.count(last_gid) == reads.count(0), (
+        f"group {last_gid} was read {reads.count(last_gid)} times vs "
+        f"{reads.count(0)} for group 0; the draft-group N-1 selection is "
+        f"still present. reads={reads}")
+
+
+def test_precompile_eagle3_helpers_still_reads_draft_group_n_minus_1():
+    """Negative control: genuine eagle3 keeps its trailing draft group."""
+    blocks_per_req = [3, 5]
+    runner = _make_runner(blocks_per_req)
+    reads: list[int] = []
+    real_tables = runner.input_batch.block_table
+
+    class _RecordingTables:
+
+        def __getitem__(self, gid):
+            reads.append(gid)
+            return real_tables[gid]
+
+    runner.input_batch.block_table = _RecordingTables()
+    runner.model_config.get_hidden_size.return_value = 16
+
+    _capture_precompile(runner, "_precompile_eagle3_helpers")
+
+    assert reads == [len(blocks_per_req) - 1] * len(reads), (
+        f"eagle3 must read only the trailing draft group, got {reads}")

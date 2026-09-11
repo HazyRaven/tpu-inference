@@ -608,3 +608,104 @@ def test_filter_token_and_prepare_initial_inputs_preserves_plain_metadata():
     assert isinstance(updated, AttentionMetadata)
     assert jnp.array_equal(updated.seq_lens, jnp.array([2]))
     assert jnp.array_equal(updated.block_tables, jnp.arange(6))
+
+
+def test_prepare_inputs_preserves_per_group_block_tables_for_gemma4_mtp():
+    """NEW-3: Gemma 4 MTP must NOT override block tables from group N-1.
+
+    The `draft_kv_cache_group_id = num_kv_cache_groups - 1` selection is
+    correct for eagle3 / dflash, where `kv_cache_manager` appends a trailing
+    draft KV cache group. Gemma 4 MTP deliberately allocates NO draft group:
+    draft layers redirect into *target* layers that span multiple groups
+    (draft 0-2 -> layer.58, in a sliding group; draft 3 -> layer.59, in the
+    full group).
+
+    Picking group N-1 therefore hands three of four draft layers the wrong
+    table, and since sliding and full groups have different block_size (hence
+    different max_num_blocks_per_req) it is a potential shape mismatch, not
+    merely wrong data. The incoming metadata already carries correct per-group
+    tables, so the proposer must leave them alone and let the model's
+    layer_redirects lookup select the right group.
+    """
+    proposer = _bare_proposer(is_gemma4_mtp=True)
+    proposer.state_leaves = None
+    proposer.method = "mtp"
+    proposer.runner = mock.MagicMock()
+    proposer.runner.kv_cache_config.kv_cache_groups = [mock.MagicMock()] * 6
+
+    captured = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return ("hidden", "ids", "last", kwargs["attn_metadata"])
+
+    proposer._prepare_inputs = _capture
+    grouped = _grouped_metadata()
+
+    with jax.set_mesh(proposer.mesh):
+        Eagle3Proposer.prepare_inputs(
+            proposer,
+            attn_metadata=grouped,
+            input_ids=jnp.array([5, 6, 7, 8]),
+            aux_hidden_states=(jnp.zeros((4, 8)), ),
+            last_sampled_token_id=jnp.array([9]),
+            next_prompt_token_id=jnp.array([9]),
+            is_in_prefill=jnp.array([False]),
+            num_rejected_tokens=jnp.array([0]),
+            num_reqs_dp=jnp.array([1]),
+        )
+
+    assert captured["block_tables"] is None, (
+        "Gemma 4 MTP must not override the per-group block tables")
+    # And it must not have reached into the input batch at all.
+    proposer.runner.input_batch.block_table.__getitem__.assert_not_called()
+
+
+def test_prepare_inputs_still_selects_draft_group_for_eagle3():
+    """The eagle3 / dflash path DOES allocate a trailing draft group.
+
+    Negative control for the fix above: non-Gemma4 proposers must keep reading
+    group N-1.
+    """
+    from tpu_inference.layers.common.attention_metadata import AttentionMetadata
+
+    proposer = _bare_proposer(is_gemma4_mtp=False)
+    proposer.state_leaves = None
+    proposer.method = "eagle3"
+    proposer.runner = mock.MagicMock()
+    proposer.runner.kv_cache_config.kv_cache_groups = [mock.MagicMock()] * 3
+
+    draft_table = mock.MagicMock()
+    draft_table.get_cpu_tensor.return_value = np.zeros((2, 4), dtype=np.int32)
+    proposer.runner.input_batch.block_table = {2: draft_table}
+
+    captured = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return ("hidden", "ids", "last", kwargs["attn_metadata"])
+
+    proposer._prepare_inputs = _capture
+    plain = AttentionMetadata(
+        input_positions=jnp.array([0, 1, 2, 3]),
+        block_tables=jnp.arange(6),
+        seq_lens=jnp.array([4]),
+        query_start_loc=jnp.array([0, 4]),
+    )
+
+    with jax.set_mesh(proposer.mesh):
+        Eagle3Proposer.prepare_inputs(
+            proposer,
+            attn_metadata=plain,
+            input_ids=jnp.array([5, 6, 7, 8]),
+            aux_hidden_states=(jnp.zeros((4, 8)), ),
+            last_sampled_token_id=jnp.array([9]),
+            next_prompt_token_id=jnp.array([9]),
+            is_in_prefill=jnp.array([False]),
+            num_rejected_tokens=jnp.array([0]),
+            num_reqs_dp=jnp.array([1]),
+        )
+
+    draft_table.get_cpu_tensor.assert_called_once()
+    assert captured["block_tables"] is not None
+    assert captured["block_tables"].shape == (8, )

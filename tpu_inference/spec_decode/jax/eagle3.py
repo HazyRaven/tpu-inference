@@ -358,15 +358,28 @@ class Eagle3Proposer:
             f"{self.method} requires auxiliary hidden states from the target model."
         )
 
-        # The last KV cache group is for the draft model.
-        num_kv_cache_groups = len(self.runner.kv_cache_config.kv_cache_groups)
-        draft_kv_cache_group_id = num_kv_cache_groups - 1
-        block_tables = self.runner.input_batch.block_table[
-            draft_kv_cache_group_id].get_cpu_tensor().reshape(-1)
-        block_tables = device_array(self.mesh,
-                                    block_tables,
-                                    sharding=PartitionSpec(
-                                        ShardingAxisName.ATTN_DATA))
+        if self.is_gemma4_mtp:
+            # Gemma4 MTP allocates NO draft KV cache group; draft layers
+            # redirect into target layers spanning MULTIPLE groups (draft 0-2
+            # -> layer.58 in a sliding group, draft 3 -> layer.59 in the full
+            # group). The incoming (Grouped)AttentionMetadata already holds the
+            # correct per-group tables, and gemma4_mtp.py selects the right one
+            # via layer_redirects, so overriding them would be wrong -- and the
+            # groups have different block_size, hence different
+            # max_num_blocks_per_req, so it can be a shape mismatch too.
+            # `_replace_attn_metadata` treats None as "preserve".
+            block_tables = None
+        else:
+            # eagle3 / dflash DO allocate a trailing draft group.
+            num_kv_cache_groups = len(
+                self.runner.kv_cache_config.kv_cache_groups)
+            draft_kv_cache_group_id = num_kv_cache_groups - 1
+            block_tables = self.runner.input_batch.block_table[
+                draft_kv_cache_group_id].get_cpu_tensor().reshape(-1)
+            block_tables = device_array(self.mesh,
+                                        block_tables,
+                                        sharding=PartitionSpec(
+                                            ShardingAxisName.ATTN_DATA))
         num_reqs = num_reqs_dp
         return self._prepare_inputs(
             state_leaves=self.state_leaves,
