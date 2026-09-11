@@ -28,7 +28,8 @@ from tpu_inference.layers.jax import JaxModule
 from tpu_inference.layers.jax.embed import JaxEmbed
 from tpu_inference.layers.jax.linear import JaxEinsum, JaxLinear, JaxLmHead
 from tpu_inference.layers.jax.norm import JaxRmsNorm
-from tpu_inference.layers.jax.rope_interface import apply_rope
+from tpu_inference.layers.jax.rope_interface import (
+    apply_rope, normalize_rope_scaling)
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
 from tpu_inference.logger import init_logger
 from tpu_inference.models.jax.gemma4 import Gemma4ForCausalLM, Gemma4MLP
@@ -179,17 +180,29 @@ class Gemma4MTPAttention(JaxModule):
 
         rope_parameters = getattr(config, "rope_parameters", {})
         if self.layer_type in rope_parameters:
+            # Transformers v5 rope config. Mirrors gemma4.py.
             rope_parameters = rope_parameters[self.layer_type]
             self.rope_theta = rope_parameters.get(
                 "rope_theta", getattr(config, "rope_theta", 10000.0))
-            self.rope_scaling = rope_parameters.get(
-                "rope_scaling", getattr(config, "rope_scaling", None))
+            # transformers v5 aliases `config.rope_scaling` to
+            # `config.rope_parameters`, so it is never None and cannot serve as
+            # a "nothing configured" default: the naive getattr default yields
+            # the whole per-layer-type dict, whose `rope_type` is None, and
+            # rope_interface then applies a spurious llama3 NTK rescale.
+            # `normalize_rope_scaling` collapses a plain default config to None.
+            rope_scaling = rope_parameters.get(
+                "rope_scaling", None) or getattr(config, "rope_scaling", None)
+            if rope_scaling is None and "rope_type" in rope_parameters:
+                rope_scaling = rope_parameters
+            self.rope_scaling = normalize_rope_scaling(rope_scaling)
             self.rope_proportion = rope_parameters.get("partial_rotary_factor",
                                                        1.0)
         else:
+            # Transformers v4 rope config.
             self.rope_theta = (getattr(config, "rope_local_base_freq", 10000.0)
                                if self.is_sliding else config.rope_theta)
-            self.rope_scaling = getattr(config, "rope_scaling", None)
+            self.rope_scaling = normalize_rope_scaling(
+                getattr(config, "rope_scaling", None))
             self.rope_proportion = 0.25 if not self.is_sliding else 1.0
 
         # transformers >= 5.15 stores head_dim / num_kv_heads per layer;
