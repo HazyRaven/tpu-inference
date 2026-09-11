@@ -693,3 +693,71 @@ def test_qwix_calibration_sets_and_clears_calibrating_flag():
         "_calibrating must be set while qwix traces the model")
     assert getattr(out, "_calibrating", False) is False, (
         "_calibrating must be cleared once calibration finishes")
+
+
+def test_mtp_layer_redirects_resolved_consistently(rng, mesh,
+                                                   mock_vllm_config):
+    """NEW-9: KV array and attention metadata must use the SAME redirect map.
+
+    The same lookup was resolved with opposite precedence eleven lines apart in
+    the same loop: the KV-cache-array selection preferred
+    `self.config.layer_redirects` while the attention-metadata selection
+    preferred `self.layer_redirects`. Both attributes are genuinely populated
+    by different owners -- the runner sets the former on draft_hf_config, the
+    model constructor computes the latter -- so if they ever diverge a draft
+    layer reads one target layer's KV array while using another target layer's
+    block tables. That is exactly the silent corruption the block-table fixes
+    are about, and it would be very hard to trace.
+
+    Give the two attributes deliberately different maps and assert both
+    consumers agree.
+    """
+    model, _ = _setup_test_model(rng, mesh, mock_vllm_config)
+
+    # Same key, different targets, on the two different owners.
+    model.model.config.layer_redirects = {"draft_layer.0": "layer.58"}
+    model.model.layer_redirects = {"draft_layer.0": "layer.59"}
+
+    seen_caches = []
+    seen_metadata = []
+    for i, layer in enumerate(model.model.layers):
+
+        def make_spy(idx):
+
+            def spy_call(kv_cache, hidden_states, attention_metadata):
+                if idx == 0:
+                    seen_caches.append(kv_cache)
+                    seen_metadata.append(attention_metadata)
+                return kv_cache, hidden_states, None
+
+            return spy_call
+
+        layer.__call__ = make_spy(i)
+
+    # Tag each cache so we can tell which target layer was picked.
+    kv_caches = [
+        jnp.full((1, 16, 2, 4, 256), float(i)) for i in range(59)
+    ] + [jnp.full((1, 16, 1, 4, 512), 59.0)]
+    # One metadata entry per candidate target layer, likewise tagged.
+    attn_metadata = {
+        "layer.58": MagicMock(name="md_58"),
+        "layer.59": MagicMock(name="md_59"),
+    }
+
+    model.model._calibrating = True
+    try:
+        model.model(kv_caches,
+                    jnp.array([42], dtype=jnp.int32),
+                    jnp.zeros((1, 5120), dtype=jnp.bfloat16),
+                    attn_metadata,
+                    layer_name_to_kv_cache=None)
+    finally:
+        model.model._calibrating = False
+
+    cache_target = int(seen_caches[0].flatten()[0])
+    metadata_target = 58 if seen_metadata[0] is attn_metadata[
+        "layer.58"] else 59
+    assert cache_target == metadata_target, (
+        f"draft_layer.0 read kv_caches[{cache_target}] but used layer."
+        f"{metadata_target}'s attention metadata; the two redirect lookups "
+        f"disagree")

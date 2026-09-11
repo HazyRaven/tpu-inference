@@ -531,9 +531,17 @@ class Gemma4MultiTokenPredictor(JaxModule):
         combined = jnp.concatenate([inputs_embeds, hidden_states], axis=-1)
         hidden_states = self.pre_projection(combined)
 
+        # Resolve ONCE, outside the loop. `self.config.layer_redirects` is set
+        # by the runner (kv_cache_manager) and `self.layer_redirects` is
+        # computed in this class's constructor; both are genuinely populated,
+        # by different owners. Resolving them with different precedence per
+        # consumer means a draft layer could read one target layer's KV array
+        # while using another target layer's block tables.
+        redirects = (getattr(self.config, "layer_redirects", None)
+                     or getattr(self, "layer_redirects", None) or {})
+
         for i, layer in enumerate(self.layers):
             layer_name = f"draft_layer.{i}"
-            redirects = getattr(self.config, "layer_redirects", None) or getattr(self, "layer_redirects", None) or {}
             if layer_name_to_kv_cache and layer_name in layer_name_to_kv_cache:
                 cache_idx = layer_name_to_kv_cache[layer_name]
             elif layer_name in redirects and isinstance(redirects[layer_name], str) and redirects[layer_name].startswith("layer."):
@@ -543,7 +551,6 @@ class Gemma4MultiTokenPredictor(JaxModule):
                 cache_idx = i
 
             if isinstance(attention_metadata, dict):
-                redirects = getattr(self, "layer_redirects", None) or getattr(self.config, "layer_redirects", {})
                 target_layer = redirects.get(layer_name, layer_name)
                 layer_attn_metadata = attention_metadata.get(target_layer, attention_metadata.get(layer_name, next(iter(attention_metadata.values()))))
             else:
