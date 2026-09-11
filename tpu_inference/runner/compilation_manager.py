@@ -36,6 +36,7 @@ from tpu_inference.layers.jax.sample.sampling import (
 from tpu_inference.layers.jax.sample.sampling_metadata import \
     TPUSupportedSamplingMetadata
 from tpu_inference.logger import init_logger
+from tpu_inference.models.common.kv_share import is_gemma4_mtp
 from tpu_inference.models.jax.jax_intermediate_tensor import \
     JaxIntermediateTensors
 from tpu_inference.runner.decode_loop import TpuSamplingState, continue_decode
@@ -1266,12 +1267,22 @@ class CompilationManager:
         self._precompile_process_and_extend_logits()
         self._precompile_extend_logits_simple()
         self._precompile_select_from_array_spec_decode()
-        if self.runner.speculative_config.method == "eagle3":
+        # NOTE: the MTP check comes first and consults `is_gemma4_mtp`, not
+        # just the method string. Upstream `use_gemma4_mtp()` is circular --
+        # it requires method == "mtp", which is itself derived from
+        # model_type == "gemma4_mtp", which only exists after
+        # `hf_config_override` rewrites gemma4_assistant -> gemma4_mtp. An
+        # explicit `--speculative-method eagle3` short-circuits that override
+        # and would otherwise route a genuine Gemma 4 MTP model into
+        # `_precompile_eagle3_helpers`, whose traced aux_hidden_states arity,
+        # sharding and position rank all disagree with the runtime.
+        if (self.runner.speculative_config.method == "mtp"
+                or is_gemma4_mtp(self.runner.speculative_config)):
+            self._precompile_mtp_helpers()
+        elif self.runner.speculative_config.method == "eagle3":
             self._precompile_eagle3_helpers()
         elif self.runner.speculative_config.method == "dflash":
             self._precompile_dflash_helpers()
-        elif self.runner.speculative_config.method == "mtp":
-            self._precompile_mtp_helpers()
 
     def _precompile_select_from_array_spec_decode(self) -> None:
         logger.info("Compiling select_from_array with different input shapes.")

@@ -218,3 +218,71 @@ def test_precompile_eagle3_helpers_still_reads_draft_group_n_minus_1():
 
     assert reads == [len(blocks_per_req) - 1] * len(reads), (
         f"eagle3 must read only the trailing draft group, got {reads}")
+
+
+def _dispatch_target(method: str, model_type: str) -> str:
+    """Runs `_precompile_speculative_decoding` and reports which helper ran."""
+    runner = _make_runner([5])
+    runner.speculative_config.method = method
+
+    draft_hf_config = mock.MagicMock()
+    draft_hf_config.model_type = model_type
+    draft_hf_config.architectures = []
+    runner.speculative_config.draft_model_config.hf_config = draft_hf_config
+    runner.speculative_config.draft_model_config.architectures = []
+    # Mirror the upstream circular definition: use_gemma4_mtp() only returns
+    # True once `method` has already been rewritten to "mtp".
+    runner.speculative_config.use_gemma4_mtp.return_value = (
+        method == "mtp" and model_type == "gemma4_mtp")
+
+    manager = CompilationManager(runner)
+    called = []
+    for helper in ("_precompile_eagle3_helpers", "_precompile_dflash_helpers",
+                   "_precompile_mtp_helpers"):
+        setattr(manager, helper, lambda h=helper: called.append(h))
+    for noop in ("_precompile_rejection_sampler",
+                 "_precompile_extract_last_sampled_tokens",
+                 "_precompile_extract_draft_token_ids",
+                 "_precompile_process_and_extend_logits",
+                 "_precompile_extend_logits_simple",
+                 "_precompile_select_from_array_spec_decode"):
+        setattr(manager, noop, lambda: None)
+
+    manager._precompile_speculative_decoding()
+    assert len(called) == 1, f"expected exactly one helper, got {called}"
+    return called[0]
+
+
+@pytest.mark.parametrize("method,model_type,expected", [
+    # Happy path: hf_config_override rewrote gemma4_assistant -> gemma4_mtp.
+    ("mtp", "gemma4_mtp", "_precompile_mtp_helpers"),
+    # An explicit --speculative-method eagle3 short-circuits the override, so
+    # `method` stays "eagle3" on a genuine Gemma 4 MTP model.
+    ("eagle3", "gemma4_mtp", "_precompile_mtp_helpers"),
+    # The raw checkpoint ships model_type gemma4_assistant, which upstream
+    # does not recognise at all.
+    ("eagle3", "gemma4_assistant", "_precompile_mtp_helpers"),
+    ("mtp", "gemma4_assistant", "_precompile_mtp_helpers"),
+    # Non-Gemma models must keep their existing routing.
+    ("eagle3", "llama", "_precompile_eagle3_helpers"),
+    ("dflash", "llama", "_precompile_dflash_helpers"),
+    ("mtp", "deepseek_v3", "_precompile_mtp_helpers"),
+])
+def test_precompile_dispatch_honours_is_gemma4_mtp(method, model_type,
+                                                   expected):
+    """NEW-6: precompile dispatch must use `is_gemma4_mtp`, not just `method`.
+
+    `is_gemma4_mtp` appears in eagle3.py, speculative_decoding_manager.py and
+    kv_cache_manager.py, but nowhere in compilation_manager.py -- exactly the
+    inconsistency the helper was introduced to eliminate. A Gemma 4 MTP model
+    reaching `_precompile_eagle3_helpers` is traced with a 3-tuple of
+    aux_hidden_states (runtime supplies 1), MLP-sharded draft hidden states
+    (runtime uses ATTN_DATA) and 1-D positions only. All three are jit cache
+    key participants, so the result is a ForbidCompile error or a silent
+    mid-serving recompile.
+
+    Safe only now that `_precompile_mtp_helpers` builds the correct metadata
+    type for multi-group models; widening this dispatch beforehand would have
+    increased exposure to that bug instead of reducing it.
+    """
+    assert _dispatch_target(method, model_type) == expected
