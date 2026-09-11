@@ -946,6 +946,7 @@ class TestTPUJaxRunnerMultimodalModelLoadedForTextOnly:
         return ModelInterface(
             model_fn=MagicMock(),
             compute_logits_fn=MagicMock(),
+            get_top_tokens_fn=None,
             pooler_fn=MagicMock(),
             combine_hidden_states_fn=MagicMock(),
             multimodal_fns=mock_multimodal_fns,
@@ -992,6 +993,7 @@ class TestTPUJaxRunnerDisableMM:
         return ModelInterface(
             model_fn=MagicMock(),
             compute_logits_fn=MagicMock(),
+            get_top_tokens_fn=None,
             pooler_fn=MagicMock(),
             combine_hidden_states_fn=MagicMock(),
             multimodal_fns=mock_multimodal_fns,

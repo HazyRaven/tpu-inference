@@ -41,6 +41,11 @@ class MultiModalInterface:
 class ModelInterface:
     model_fn: Callable
     compute_logits_fn: Callable
+    # Sparse argmax over masked centroids, for models that define
+    # `get_top_tokens`. Like `compute_logits_fn` it takes `state_leaves` as its
+    # first argument so parameters enter as jit arguments rather than being
+    # baked into the HLO as constants. None for models without it.
+    get_top_tokens_fn: Callable | None
     pooler_fn: Callable
     combine_hidden_states_fn: Callable
     multimodal_fns: MultiModalInterface

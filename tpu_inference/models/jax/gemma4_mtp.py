@@ -138,9 +138,19 @@ class Gemma4MTPMaskedEmbedder(JaxModule):
         self,
         hidden_states: jax.Array,
         lm_head_weight: jax.Array,
+        suppress_token_ids: Optional[jax.Array] = None,
     ) -> jax.Array:
-        """Sparse argmax — returns vocab token IDs directly."""
+        """Sparse argmax — returns vocab token IDs directly.
+
+        `suppress_token_ids` must be honoured here too: `compute_logits`
+        applies it to the dense logits, so without it the sparse path could
+        return a token the dense path masks to -inf, and the two branches
+        would disagree for the same hidden state.
+        """
         logits, indices = self._select_and_score(hidden_states, lm_head_weight)
+        if suppress_token_ids is not None and len(suppress_token_ids) > 0:
+            suppressed = jnp.isin(indices, suppress_token_ids)
+            logits = jnp.where(suppressed, -jnp.inf, logits)
         best_idx = jnp.argmax(logits, axis=-1, keepdims=True)
         return jnp.take_along_axis(indices, best_idx, axis=-1).squeeze(-1)
 
@@ -746,5 +756,6 @@ class Gemma4MTPForCausalLM(JaxModule, LoadableWithIterator):
             return self.masked_embedding.get_top_tokens(
                 hidden_states,
                 self._get_full_lm_head_weight(),
+                suppress_token_ids=self._suppress_token_ids,
             )
         return jnp.argmax(self.compute_logits(hidden_states), axis=-1)

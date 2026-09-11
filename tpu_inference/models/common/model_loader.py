@@ -453,6 +453,15 @@ def get_flax_model(
         hidden_state, *_ = args
         return model.compute_logits(hidden_state)
 
+    @jax.jit
+    def run_get_top_tokens(state_leaves, hidden_states):
+        # Symmetric with run_compute_logits: parameters arrive as jit
+        # arguments via state_leaves rather than being captured from a live
+        # module and lowered to stablehlo constants.
+        state = jax.tree_util.tree_unflatten(_state_treedef, state_leaves)
+        model = nnx.merge(graphdef, state)
+        return model.get_top_tokens(hidden_states)
+
     # Multi-modal support only
     # This function calculates the image/video token's embeddings by VIT
     def run_embed_multimodal(state_leaves, modality=None, **kwargs):
@@ -599,6 +608,8 @@ def get_flax_model(
     return ModelInterface(
         model_fn=wrapped_model_fn,
         compute_logits_fn=compute_logits_fn,
+        get_top_tokens_fn=(run_get_top_tokens if hasattr(
+            model, "get_top_tokens") else None),
         pooler_fn=pooler_fn,
         combine_hidden_states_fn=combine_hidden_states_fn,
         multimodal_fns=multimodal_fns,
@@ -654,6 +665,8 @@ def get_vllm_model(
     return ModelInterface(
         model_fn=jit_model,
         compute_logits_fn=compute_logits_fn,
+        # The vllm-impl path has no sparse-centroid model.
+        get_top_tokens_fn=None,
         pooler_fn=pooler_fn,
         combine_hidden_states_fn=combine_hidden_states_fn,
         multimodal_fns=multimodal_fns,

@@ -116,6 +116,7 @@ class Eagle3Proposer:
 
         self.model_fn = model.model_fn
         self.compute_logits_fn = model.compute_logits_fn
+        self.get_top_tokens_fn = model.get_top_tokens_fn
         self.pooler_fn = model.pooler_fn
         self.combine_hidden_states_fn = model.combine_hidden_states_fn
         self.state = model.state
@@ -583,9 +584,16 @@ class Eagle3Proposer:
 
     def _get_draft_token_ids(self, state_leaves: Any,
                              hidden_states: jax.Array) -> jax.Array:
-        if (hasattr(self, "model") and hasattr(self.model, "get_top_tokens")
+        if (getattr(self, "get_top_tokens_fn", None) is not None
                 and getattr(self.model, "masked_embedding", None) is not None):
-            draft_token_ids = self.model.get_top_tokens(hidden_states)
+            # Go through the jitted state_leaves closure, not the live module:
+            # `_propose` has `self` in static_argnums, so touching
+            # `self.model` here would bake lm_head.weight, token_ordering and
+            # centroids into the HLO as constants -- stale after any
+            # post-trace parameter mutation, hundreds of MB in the compile
+            # cache, and with the NamedSharding lost.
+            draft_token_ids = self.get_top_tokens_fn(state_leaves,
+                                                     hidden_states)
         else:
             lora_metadata = None
             logits = self.compute_logits_fn(state_leaves, hidden_states,
