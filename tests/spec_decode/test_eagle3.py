@@ -442,3 +442,169 @@ def test_replace_attn_metadata_preserves_plain_attention_metadata_block_tables()
     updated = _replace_attn_metadata(meta, input_positions=jnp.array([2]), block_tables=None)
     assert updated.block_tables is not None
     assert jnp.array_equal(updated.block_tables, jnp.array([[10, 20]]))
+
+
+def _bare_proposer(is_gemma4_mtp: bool = True) -> Eagle3Proposer:
+    """Builds an Eagle3Proposer without running __init__.
+
+    `Eagle3Proposer.__init__` needs a full VllmConfig (and therefore network
+    access to a real HF config). These tests only exercise the attention
+    metadata plumbing, so we construct the object directly and populate only
+    the attributes those code paths read.
+    """
+    proposer = object.__new__(Eagle3Proposer)
+    devices = np.array(jax.devices()[:1]).reshape((1, 1))
+    proposer.mesh = jax.sharding.Mesh(devices, axis_names=("data", "model"))
+    proposer.is_gemma4_mtp = is_gemma4_mtp
+    proposer.is_mtp = is_gemma4_mtp
+    return proposer
+
+
+def _grouped_metadata():
+    """A 2-group GroupedAttentionMetadata with DIFFERENT per-group tables."""
+    from tpu_inference.layers.common.attention_metadata import (
+        AttentionMetadata,
+        GroupedAttentionMetadata,
+    )
+
+    def _group(block_tables):
+        return AttentionMetadata(
+            input_positions=jnp.array([0, 1, 2, 3]),
+            block_tables=block_tables,
+            seq_lens=jnp.array([4]),
+            query_start_loc=jnp.array([0, 4]),
+        )
+
+    # Distinct lengths mirror the real SWA layout, where sliding and full
+    # groups have different block_size and thus different
+    # max_num_blocks_per_req.
+    return GroupedAttentionMetadata(
+        groups=(_group(jnp.arange(3)), _group(jnp.arange(5))),
+        layer_names_per_group=(("layer.58",), ("layer.59",)),
+    )
+
+
+def test_filter_token_and_prepare_initial_inputs_accepts_grouped_metadata():
+    """NEW-2: `_filter_token_and_prepare_initial_inputs` must not use bare replace().
+
+    `GroupedAttentionMetadata` is a `dict` subclass, not a dataclass, so
+    `dataclasses.replace` raises `TypeError`. Gemma 4 MTP deliberately routes
+    grouped metadata straight through to the proposer
+    (`speculative_decoding_manager` skips the collapse when is_gemma4_mtp), so
+    this site is reached as soon as SWA gives the model >1 KV cache group.
+    """
+    from tpu_inference.layers.common.attention_metadata import GroupedAttentionMetadata
+
+    proposer = _bare_proposer()
+    proposer._prepare_hidden_states_and_input_ids = lambda *a, **k: (
+        "hidden",
+        "ids",
+        "last",
+    )
+    grouped = _grouped_metadata()
+
+    new_seq_lens = jnp.array([2])
+    new_query_start_loc = jnp.array([0, 2])
+    _, _, _, updated = proposer._filter_token_and_prepare_initial_inputs(
+        state_leaves=None,
+        token_indices=jnp.array([0, 1, 2, 3]),
+        query_start_loc=new_query_start_loc,
+        seq_lens=new_seq_lens,
+        input_ids=jnp.array([5, 6, 7, 8]),
+        aux_hidden_states=(jnp.zeros((4, 8)),),
+        attn_metadata=grouped,
+        next_token_ids=jnp.array([9]),
+        num_reqs=jnp.array([1]),
+    )
+
+    assert isinstance(updated, GroupedAttentionMetadata)
+    for gid, group in enumerate(updated.groups):
+        assert jnp.array_equal(group.seq_lens, new_seq_lens)
+        assert jnp.array_equal(group.query_start_loc, new_query_start_loc)
+        # Per-group block tables must survive untouched.
+        assert jnp.array_equal(group.block_tables, grouped.groups[gid].block_tables)
+
+
+def test_prepare_inputs_block_table_update_accepts_grouped_metadata():
+    """NEW-2: the `block_tables=` mutation inside `_prepare_inputs` too.
+
+    This site sits upstream of the one above, so it is the first to crash.
+    `_prepare_inputs` is jitted with `self` static; call the underlying
+    function through `__wrapped__` so no tracing is required.
+    """
+    from tpu_inference.layers.common.attention_metadata import GroupedAttentionMetadata
+
+    proposer = _bare_proposer()
+    captured = {}
+
+    def _capture(
+        state_leaves,
+        token_indices,
+        query_start_loc,
+        seq_lens,
+        input_ids,
+        aux_hidden_states,
+        attn_metadata,
+        next_token_ids,
+        num_reqs,
+    ):
+        captured["attn_metadata"] = attn_metadata
+        return ("hidden", "ids", "last", attn_metadata)
+
+    proposer._filter_token_and_prepare_initial_inputs = _capture
+
+    grouped = _grouped_metadata()
+    override = jnp.arange(11)
+
+    Eagle3Proposer._prepare_inputs.__wrapped__(
+        proposer,
+        state_leaves=None,
+        num_reqs=jnp.array([1]),
+        block_tables=override,
+        attn_metadata=grouped,
+        input_ids=jnp.array([5, 6, 7, 8]),
+        aux_hidden_states=(jnp.zeros((4, 8)),),
+        last_sampled_token_id=jnp.array([9]),
+        next_prompt_token_id=jnp.array([9]),
+        is_in_prefill=jnp.array([False]),
+        num_rejected_tokens=jnp.array([0]),
+    )
+
+    updated = captured["attn_metadata"]
+    assert isinstance(updated, GroupedAttentionMetadata)
+    for group in updated.groups:
+        assert jnp.array_equal(group.block_tables, override)
+
+
+def test_filter_token_and_prepare_initial_inputs_preserves_plain_metadata():
+    """The 1-group path must keep working exactly as before."""
+    from tpu_inference.layers.common.attention_metadata import AttentionMetadata
+
+    proposer = _bare_proposer(is_gemma4_mtp=False)
+    proposer._prepare_hidden_states_and_input_ids = lambda *a, **k: (
+        "hidden",
+        "ids",
+        "last",
+    )
+    plain = AttentionMetadata(
+        input_positions=jnp.array([0, 1, 2, 3]),
+        block_tables=jnp.arange(6),
+        seq_lens=jnp.array([4]),
+        query_start_loc=jnp.array([0, 4]),
+    )
+
+    _, _, _, updated = proposer._filter_token_and_prepare_initial_inputs(
+        state_leaves=None,
+        token_indices=jnp.array([0, 1, 2, 3]),
+        query_start_loc=jnp.array([0, 2]),
+        seq_lens=jnp.array([2]),
+        input_ids=jnp.array([5, 6, 7, 8]),
+        aux_hidden_states=(jnp.zeros((4, 8)),),
+        attn_metadata=plain,
+        next_token_ids=jnp.array([9]),
+        num_reqs=jnp.array([1]),
+    )
+
+    assert isinstance(updated, AttentionMetadata)
+    assert jnp.array_equal(updated.seq_lens, jnp.array([2]))
+    assert jnp.array_equal(updated.block_tables, jnp.arange(6))

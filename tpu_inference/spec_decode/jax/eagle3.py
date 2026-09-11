@@ -472,7 +472,8 @@ class Eagle3Proposer:
            attn_metadata.query_start_loc, attn_metadata.seq_lens, num_reqs,
            num_rejected_tokens, input_ids)
 
-        attn_metadata = replace(attn_metadata, block_tables=block_tables)
+        attn_metadata = _replace_attn_metadata(attn_metadata,
+                                               block_tables=block_tables)
         return self._filter_token_and_prepare_initial_inputs(
             state_leaves, token_indices, new_query_start_loc, new_seq_lens,
             input_ids, aux_hidden_states, attn_metadata, next_token_ids,
@@ -518,7 +519,7 @@ class Eagle3Proposer:
         )(input_ids, token_indices, attn_metadata.input_positions,
           aux_hidden_states)
 
-        attn_metadata = replace(
+        attn_metadata = _replace_attn_metadata(
             attn_metadata,
             input_positions=input_positions,
             seq_lens=seq_lens,
