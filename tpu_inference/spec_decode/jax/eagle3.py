@@ -190,6 +190,23 @@ class Eagle3Proposer:
                     "Failed to locate draft or target embedding parameter in State objects."
                 )
 
+            if self.is_gemma4_mtp and draft_embed_param is not None:
+                # Post-condition: Gemma4 MTP concatenates the token embedding
+                # with the backbone hidden state before pre_projection, so the
+                # embedding MUST be backbone-width by now. Without this check a
+                # failed swap only surfaces as near-zero acceptance.
+                width = draft_embed_param.value.shape[-1]
+                expected = getattr(self.model, "model", self.model)
+                expected = getattr(expected, "backbone_hidden_size", None)
+                if expected is not None and width != expected:
+                    raise ValueError(
+                        f"Gemma4 MTP embedding sharing failed: draft "
+                        f"embed_tokens is {draft_embed_param.value.shape}, "
+                        f"expected width {expected}.")
+                logger.info(
+                    "Gemma4 MTP: shared target embed_tokens %s into drafter.",
+                    draft_embed_param.value.shape)
+
         # The embed_tokens assignment above may have mutated `self.state`;
         # re-derive `state_leaves` so the dispatch-side view matches.
         if isinstance(self.state, nnx.State):

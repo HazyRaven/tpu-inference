@@ -386,9 +386,15 @@ def test_mtp_calibration_forward_unshared_embeddings_and_heterogeneous_kv(rng, m
     hidden_states = jnp.zeros((1, 5120), dtype=jnp.bfloat16)
     attn_metadata = MagicMock()
 
-    kv_caches_out, h_draft, h_backbone = model.model(
-        kv_caches, input_ids, hidden_states, attn_metadata, layer_name_to_kv_cache=None
-    )
+    # The zero-embedding fallback is calibration-only; at serving time a width
+    # mismatch now raises rather than silently destroying token identity.
+    model.model._calibrating = True
+    try:
+        kv_caches_out, h_draft, h_backbone = model.model(
+            kv_caches, input_ids, hidden_states, attn_metadata, layer_name_to_kv_cache=None
+        )
+    finally:
+        model.model._calibrating = False
     assert h_draft.shape == (1, 4096)
     assert h_backbone.shape == (1, 5120)
     assert len(accessed_caches) == 4
@@ -568,3 +574,122 @@ def test_mtp_sliding_rope_frequencies_match_unscaled_reference(rng, mesh):
     assert jnp.allclose(actual, expected, atol=1e-6), (
         "draft sliding-layer RoPE diverges from the unscaled reference the "
         "target model used when it rotated and cached K")
+
+
+def _mtp_forward_args(model):
+    """Minimal args for a Gemma4MultiTokenPredictor forward pass."""
+    for layer in model.model.layers:
+
+        def make_spy(l):
+
+            def spy_call(kv_cache, hidden_states, attention_metadata):
+                return kv_cache, hidden_states, None
+
+            return spy_call
+
+        layer.__call__ = make_spy(layer)
+
+    kv_caches = ([jnp.zeros((1, 16, 2, 4, 256)) for _ in range(59)] +
+                 [jnp.zeros((1, 16, 1, 4, 512))])
+    return dict(
+        kv_caches=kv_caches,
+        input_ids=jnp.array([42], dtype=jnp.int32),
+        hidden_states=jnp.zeros((1, 5120), dtype=jnp.bfloat16),
+        attention_metadata=MagicMock(),
+        layer_name_to_kv_cache=None,
+    )
+
+
+def test_mtp_embedding_width_mismatch_raises_at_serving(rng, mesh,
+                                                        mock_vllm_config):
+    """NEW-4: a width mismatch outside calibration must fail loud.
+
+    At serving time `Eagle3Proposer.load_model` swaps the draft's embed_tokens
+    for the target's [vocab, backbone_hidden_size] table. If that swap does not
+    land -- params are None, a path name changed, load_model ordering shifted
+    -- the previous code silently replaced the ENTIRE token embedding with
+    zeros and continued. The drafter degenerates into a hidden-state-only
+    predictor with no idea which token it was given, so acceptance collapses to
+    near zero with no log line and no exception.
+    """
+    model, _ = _setup_test_model(rng, mesh, mock_vllm_config)
+    assert model.model.embed_tokens.features != model.model.backbone_hidden_size
+    assert not getattr(model.model, "_calibrating", False)
+
+    with pytest.raises(ValueError, match="embedding"):
+        model.model(**_mtp_forward_args(model))
+
+
+def test_mtp_embedding_width_mismatch_allowed_during_calibration(
+        rng, mesh, mock_vllm_config):
+    """The same mismatch is legitimate during PTQ/QWIX calibration.
+
+    Calibration runs BEFORE load_model shares the target embedding, so
+    embed_tokens is still draft-width and pre_projection wants backbone-width.
+    Substituting zeros is fine there: only the consumed weight shapes matter
+    for tracing.
+    """
+    model, _ = _setup_test_model(rng, mesh, mock_vllm_config)
+    model.model._calibrating = True
+    try:
+        _, h_draft, h_backbone = model.model(**_mtp_forward_args(model))
+    finally:
+        model.model._calibrating = False
+
+    assert h_draft.shape == (1, 4096)
+    assert h_backbone.shape == (1, 5120)
+
+
+def test_qwix_calibration_sets_and_clears_calibrating_flag():
+    """`qwix_quantize_nnx_model` must set `_calibrating` around quantize_model.
+
+    Without this the hardened check above would break FP8/QWIX boot, which is
+    the one caller that legitimately needs the zero-embedding fallback. The
+    flag is set on the live module before tracing, so it is a plain Python
+    attribute rather than anything a tracer sees.
+    """
+    from unittest.mock import patch
+
+    from tpu_inference.models.jax.utils.qwix import qwix_utils
+
+    observed = {}
+
+    class _FakeModel:
+
+        def __call__(self, kv_caches, input_ids, hidden_states,
+                     attention_metadata):
+            pass
+
+    fake_model = _FakeModel()
+    fake_model.backbone_hidden_size = 5120
+    fake_model.vllm_config = MagicMock()
+    fake_model.vllm_config.model_config.use_mla = False
+    fake_model.vllm_config.sharding_config.total_dp_size = 1
+
+    def _fake_quantize_model(model, provider, **model_input):
+        observed["during"] = getattr(model, "_calibrating", False)
+        return model
+
+    # hbm_usage_gb reads device.memory_stats(), which is None on CPU.
+    with patch.object(qwix_utils.qwix, "quantize_model",
+                      _fake_quantize_model), \
+         patch.object(qwix_utils, "create_kv_caches", return_value=[]), \
+         patch.object(qwix_utils.utils, "hbm_usage_gb", return_value=0.0), \
+         patch.object(qwix_utils, "device_array",
+                      side_effect=lambda mesh, x, **kw: x):
+        out = qwix_utils.qwix_quantize_nnx_model(
+            model=fake_model,
+            qwix_config=[],
+            rng=jax.random.PRNGKey(0),
+            mesh=MagicMock(),
+            num_hidden_layers=0,
+            kv_cache_block_size=16,
+            kv_cache_num_kv_heads=4,
+            kv_cache_head_size=256,
+            kv_cache_dtype="auto",
+        )
+
+    assert observed["during"] is True, (
+        "_calibrating must be set while qwix traces the model")
+    assert getattr(out, "_calibrating", False) is False, (
+        "_calibrating must be cleared once calibration finishes")

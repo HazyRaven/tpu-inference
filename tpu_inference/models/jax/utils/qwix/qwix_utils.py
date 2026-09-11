@@ -239,8 +239,17 @@ def qwix_quantize_nnx_model(model: nnx.Module, qwix_config: List[dict],
                                   dtype=jnp.bfloat16)
         hidden_states = device_array(mesh, hidden_states)
         model_input["hidden_states"] = hidden_states
-    model = qwix.quantize_model(model, qwix.PtqProvider(qwix_rules),
-                                **model_input)
+    # Calibration runs before Eagle3Proposer.load_model shares the target's
+    # embedding table into the drafter, so models such as Gemma4 MTP legitimately
+    # see a draft-width embedding here. Mark the module so they can take their
+    # tracing-only fallback instead of raising. Set on the live module before
+    # tracing, so it is a plain Python attribute and never a tracer value.
+    setattr(model, "_calibrating", True)
+    try:
+        model = qwix.quantize_model(model, qwix.PtqProvider(qwix_rules),
+                                    **model_input)
+    finally:
+        setattr(model, "_calibrating", False)
     return model
 
 

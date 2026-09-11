@@ -509,7 +509,24 @@ class Gemma4MultiTokenPredictor(JaxModule):
     ) -> Tuple[List[jax.Array], jax.Array, jax.Array]:
         inputs_embeds = self.embed_input_ids(input_ids)
         if inputs_embeds.shape[-1] != self.backbone_hidden_size:
-            inputs_embeds = jnp.zeros((*inputs_embeds.shape[:-1], self.backbone_hidden_size), dtype=inputs_embeds.dtype)
+            # Only legitimate during offline PTQ/QWIX calibration, which runs
+            # BEFORE Eagle3Proposer.load_model swaps in the target's
+            # backbone-dim embedding table. At serving time this means the swap
+            # did not land, and zeroing here would silently destroy all token
+            # identity -> ~0% acceptance with no error. Fail loud instead.
+            if not getattr(self, "_calibrating", False):
+                raise ValueError(
+                    f"Gemma4 MTP embedding width {inputs_embeds.shape[-1]} != "
+                    f"backbone_hidden_size {self.backbone_hidden_size}. The "
+                    f"target embedding table was not shared into the drafter; "
+                    f"check Eagle3Proposer.load_model embedding resolution.")
+            logger.warning(
+                "Gemma4 MTP calibration: substituting zero inputs_embeds "
+                "(%d -> %d). This is only valid for PTQ tracing.",
+                inputs_embeds.shape[-1], self.backbone_hidden_size)
+            inputs_embeds = jnp.zeros(
+                (*inputs_embeds.shape[:-1], self.backbone_hidden_size),
+                dtype=inputs_embeds.dtype)
 
         combined = jnp.concatenate([inputs_embeds, hidden_states], axis=-1)
         hidden_states = self.pre_projection(combined)
