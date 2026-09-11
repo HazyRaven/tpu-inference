@@ -1612,13 +1612,17 @@ class CompilationManager:
 
         num_kv_cache_groups = len(self.runner.kv_cache_config.kv_cache_groups)
         draft_kv_cache_group_id = num_kv_cache_groups - 1
-        block_tables = self.runner.input_batch.block_table[
-            draft_kv_cache_group_id].get_cpu_tensor().reshape(-1)
         dp_sharding = NamedSharding(
             self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA, ))
-        block_tables = device_array(self.runner.mesh,
-                                    block_tables,
-                                    sharding=dp_sharding)
+
+        def build_block_table(kv_cache_gid: int) -> jax.Array:
+            table = self.runner.input_batch.block_table[
+                kv_cache_gid].get_cpu_tensor().reshape(-1)
+            return device_array(self.runner.mesh,
+                                table,
+                                sharding=dp_sharding)
+
+        block_tables = build_block_table(draft_kv_cache_group_id)
 
         seq_lens = self._create_dummy_tensor((self.runner.max_num_reqs, ),
                                              jnp.int32, dp_sharding)
@@ -1665,15 +1669,36 @@ class CompilationManager:
                     positions = self._create_dummy_tensor(
                         (num_tokens, ), jnp.int32, dp_sharding)
 
-                attention_metadata = AttentionMetadata(
-                    input_positions=positions,
-                    block_tables=block_tables,
-                    seq_lens=seq_lens,
-                    query_start_loc=query_start_loc,
-                    request_distribution=request_distribution,
-                    mamba_state_indices=mamba_state_indices,
-                    padded_num_reqs=num_reqs,
-                )
+                def build_attn(bt: jax.Array | None) -> AttentionMetadata:
+                    return AttentionMetadata(
+                        input_positions=positions,
+                        block_tables=bt,
+                        seq_lens=seq_lens,
+                        query_start_loc=query_start_loc,
+                        request_distribution=request_distribution,
+                        mamba_state_indices=mamba_state_indices,
+                        padded_num_reqs=num_reqs,
+                    )
+
+                if num_kv_cache_groups <= 1:
+                    attention_metadata = build_attn(block_tables)
+                else:
+                    # Must mirror the runtime structure built in
+                    # `_prepare_inputs` (tpu_runner.py), or the precompiled
+                    # executable does not match and we recompile.
+                    # `GroupedAttentionMetadata` is its own pytree node and
+                    # flattens once per group, so tracing a flat
+                    # `AttentionMetadata` here is a guaranteed jit cache miss
+                    # under SWA / hybrid KV layouts. Mirrors
+                    # `_precompile_backbone_helper`.
+                    attention_metadata = GroupedAttentionMetadata(
+                        groups=tuple(
+                            build_attn(build_block_table(gid))
+                            for gid in range(num_kv_cache_groups)),
+                        layer_names_per_group=tuple(
+                            tuple(group.layer_names) for group in
+                            self.runner.kv_cache_config.kv_cache_groups),
+                    )
 
                 def drafter_propose_warmup(_fn, _args, _call_kwargs):
                     new_args = (self.runner.kv_caches, ) + _args[1:]
